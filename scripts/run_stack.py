@@ -7,11 +7,12 @@ is meant to be public. A process that crashes is restarted with a growing delay;
 """
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Mapping, Optional
+from typing import Callable, Dict, List, Mapping, Optional
 
 from dotenv import load_dotenv
 
@@ -22,15 +23,18 @@ START_GAP_SECONDS = 1.0
 MAX_RESTART_DELAY = 30.0
 STABLE_SECONDS = 60.0        # a process that ran this long has its restart delay reset
 POLL_SECONDS = 1.0
+CONSOLE = "console"
+CONSOLE_WAIT_SECONDS = 120.0
 
 PROCESSES = [
+    # The page answers first: on a small plan the agents take minutes to load, and a visitor should see that, not nothing
+    (CONSOLE, ["-m", "web.server"]),
     ("demo-app", ["-m", "uvicorn", "demo_target_app.app:app", "--host", "127.0.0.1", "--port", "9000"]),
     ("Agent_5", ["-m", "agents.Agent_5"]),
     ("Agent_4", ["-m", "agents.Agent_4"]),
     ("Agent_3", ["-m", "agents.Agent_3"]),
     ("Agent_2", ["-m", "agents.Agent_2"]),
     ("Agent_1", ["-m", "agents.Agent_1"]),   # receivers first, so Agent_1 can reach everyone
-    ("console", ["-m", "web.server"]),
 ]
 
 
@@ -47,6 +51,22 @@ def missing_env(env: Mapping[str, str]) -> List[str]:
     provider = env.get("LLM_PROVIDER", "").strip().lower()
     llm_key = {"asi1": "ASI1_API_KEY", "groq": "GROQ_API_KEY"}.get(provider, "GEMINI_API_KEY")
     return [name for name in (*REQUIRED_ENV, llm_key) if not env.get(name, "").strip()]
+
+
+def console_port(env: Mapping[str, str]) -> int:
+    return int(env.get("WEB_PORT") or env.get("PORT") or 8080)
+
+
+def wait_for_port(port: int, seconds: float, stopped: Callable[[], bool]) -> bool:
+    """True once something listens on `port`. The agents wait for this so they don't compete with the console for CPU."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline and not stopped():
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1):
+                return True
+        except OSError:
+            time.sleep(POLL_SECONDS)
+    return False
 
 
 def next_delay(delay: float, ran_for: float) -> float:
@@ -103,6 +123,8 @@ def main() -> int:
         if stopping["now"]:
             break
         m.start(env)
+        if m.name == CONSOLE:
+            wait_for_port(console_port(env), CONSOLE_WAIT_SECONDS, lambda: stopping["now"])
         time.sleep(START_GAP_SECONDS)
 
     while not stopping["now"]:

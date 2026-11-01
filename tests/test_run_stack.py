@@ -53,3 +53,26 @@ def test_docker_context_cannot_contain_secrets():
     ignored = (root / ".dockerignore").read_text(encoding="utf-8").splitlines()
     assert ".env" in ignored and "*_data.json" in ignored
     assert "COPY . " not in (root / "Dockerfile").read_text(encoding="utf-8")
+
+
+def test_the_page_answers_before_the_agents_load():
+    """On a 0.1 CPU plan the agents take minutes to load, and a visitor must not see nothing for that long."""
+    assert PROCESSES[0][0] == "console"
+    assert [name for name, _ in PROCESSES].count("Agent_1") == 1
+
+
+def test_the_console_port_follows_the_host():
+    assert run_stack.console_port({"PORT": "10000"}) == 10000
+    assert run_stack.console_port({"WEB_PORT": "9001", "PORT": "10000"}) == 9001
+    assert run_stack.console_port({}) == 8080
+
+
+def test_waiting_for_the_console_stops_when_it_listens_or_time_runs_out():
+    import socket
+    with socket.socket() as server:
+        server.bind(("127.0.0.1", 0))
+        server.listen()
+        port = server.getsockname()[1]
+        assert run_stack.wait_for_port(port, 2, lambda: False) is True
+    assert run_stack.wait_for_port(port, 0, lambda: False) is False
+    assert run_stack.wait_for_port(port, 5, lambda: True) is False

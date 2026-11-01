@@ -26,6 +26,7 @@ COPY scripts ./scripts
 COPY web ./web
 COPY demo_target_app ./demo_target_app
 COPY --from=console /build/dist ./frontend/dist
+RUN python -m compileall -q /app      # ready-compiled code starts faster on a small CPU
 
 # uagents keeps each agent's state as <address>_data.json in the working directory
 RUN useradd --uid 1000 --create-home sentinel && mkdir /data && chown sentinel:sentinel /data
@@ -34,7 +35,7 @@ WORKDIR /data
 
 ENV WEB_HOST=0.0.0.0
 EXPOSE 8080
-HEALTHCHECK --interval=30s --timeout=5s --start-period=60s \
+HEALTHCHECK --interval=30s --timeout=15s --start-period=300s \
     CMD python -c "import os, urllib.request as u; u.urlopen('http://127.0.0.1:' + (os.environ.get('WEB_PORT') or os.environ.get('PORT') or '8080') + '/api/health', timeout=4)"
 
 # Refuses to start without the required env vars; the console refuses to start without CONSOLE_PASSWORD

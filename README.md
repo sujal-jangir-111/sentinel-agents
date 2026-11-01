@@ -12,7 +12,7 @@
 ![FastAPI](https://img.shields.io/badge/FastAPI-WebSockets-009688?style=flat-square&logo=fastapi&logoColor=white)
 ![React](https://img.shields.io/badge/React_19-TypeScript-61DAFB?style=flat-square&logo=react&logoColor=black)
 ![Docker](https://img.shields.io/badge/Docker-226_MB-2496ED?style=flat-square&logo=docker&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-588_passing-2EA44F?style=flat-square)
+![Tests](https://img.shields.io/badge/tests-591_passing-2EA44F?style=flat-square)
 
 <br>
 
@@ -199,7 +199,7 @@ The first run looked fine in the UI, with a green "safety check" badge on every 
 | **Security data** | OSV.dev, PyPI metadata, custom SAST rules, Python `ast` import mapping, CycloneDX 1.5 SBOM |
 | **Integrations** | GitHub REST API |
 | **Delivery** | Docker (multi-stage, non-root, 226 MB), process supervisor, healthcheck |
-| **Testing** | pytest, pytest-asyncio, respx: 588 tests, plus real-browser journeys and the answer key above |
+| **Testing** | pytest, pytest-asyncio, respx: 591 tests, plus real-browser journeys and the answer key above |
 
 <br>
 
@@ -254,15 +254,37 @@ cd frontend && npm run typecheck
 
 ## Deploy it
 
-The whole system is **one container with one public port**. The agents talk over `127.0.0.1` inside it, so publish only the console.
+The whole system is **one container with one public port**. The agents talk over `127.0.0.1` inside it, so publish only the console. The server refuses to listen publicly without `CONSOLE_PASSWORD`. This is deliberate.
 
-1. Push this repository and point any Docker host at the `Dockerfile`. The image uses the `PORT` the host assigns, or 8080.
+### On Render
+
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/sujal-jangir-111/sentinel-agents)
+
+The included [render.yaml](render.yaml) describes the service. Render generates the seeds and admin token, and asks you for four values:
+
+| Value | What to enter |
+|---|---|
+| `GROQ_API_KEY` | Your Groq key |
+| `GITHUB_TOKEN` | Your GitHub token |
+| `DEMO_REPO_FULL_NAME` | The repository Sentinel may open pull requests on, as `owner/name` |
+| `CONSOLE_PASSWORD` | A long password for the site |
+
+These are measurements from the real image under each plan's CPU and memory limits, simulated with Docker:
+
+| Plan limits | Page answers | All agents online | A real fix |
+|---|---|---|---|
+| **Free:** 512 MB, 0.1 CPU | 49 s | 4 min 46 s | 38 s |
+| **Starter:** 512 MB, 0.5 CPU | 6 s | 37 s | 15 s |
+
+Free services sleep after 15 idle minutes, so the first visit after a quiet spell pays that start-up time again, and sleeping clears the chats. Memory reached about 470 of 512 MB, so busy use or large repositories may need a bigger plan.
+
+### On any other Docker host
+
+1. Point the host at the `Dockerfile`. The image uses the `PORT` the host assigns, or 8080.
 2. Set the [required variables](#configuration) as secrets on the host. `.env` is deliberately left out of the image.
-3. Give it about **1 GB of memory**. The stack idles at around 430 MB, so a 512 MB plan is too small.
+3. Give it at least 512 MB of memory. 1 GB leaves room for busy use.
 4. Attach a volume at `/data` to keep case records across deployments.
-5. Use the host's HTTPS, then check `/api/health`. It should report `"agents_online": true` within about a minute.
-
-The server refuses to listen publicly without `CONSOLE_PASSWORD`. This is deliberate.
+5. Use the host's HTTPS, then check `/api/health` until it reports `"agents_online": true`.
 
 <br>
 
@@ -294,10 +316,11 @@ The server refuses to listen publicly without `CONSOLE_PASSWORD`. This is delibe
 ├── frontend/          The React chat interface
 ├── scripts/           Process supervisor, Windows start script, demo repository builder
 ├── demo_target_app/   A deliberately broken service to try Sentinel on
-├── tests/             588 tests, including regressions for every bug found in live runs
+├── tests/             591 tests, including regressions for every bug found in live runs
 ├── docs/images/       The screenshots above
 ├── Dockerfile         One image with everything in it
-└── docker-compose.yml
+├── docker-compose.yml
+└── render.yaml        One-click deployment on Render
 ```
 
 <br>

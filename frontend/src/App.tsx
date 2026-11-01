@@ -40,7 +40,7 @@ export default function App() {
 
       {offline && (
         <p role="status" className="flex items-center justify-center gap-2 bg-warn-soft px-5 py-2 text-sm text-warn">
-          <WifiOff size={15} /> {s.connected ? "The agents are offline right now." : "Reconnecting…"}
+          <WifiOff size={15} /> {s.connected ? "The agents are starting up. This can take a few minutes." : "Reconnecting…"}
         </p>
       )}
 

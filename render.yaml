@@ -1,0 +1,36 @@
+# Render Blueprint: one Docker web service. Render asks for the sync: false values once, on first creation.
+# plan: free sleeps after 15 idle minutes and takes minutes to wake. plan: 0.5c-512mb stays on and starts in under a minute.
+services:
+  - type: web
+    name: sentinel-agents
+    runtime: docker
+    plan: free
+    region: singapore
+    branch: main
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    autoDeployTrigger: commit
+    envVars:
+      - key: LLM_PROVIDER
+        value: groq
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: DEMO_REPO_FULL_NAME
+        sync: false
+      - key: CONSOLE_PASSWORD
+        sync: false
+      - key: DEMO_ADMIN_TOKEN
+        generateValue: true
+      - key: ORCHESTRATOR_SEED
+        generateValue: true
+      - key: WATCHDOG_SEED
+        generateValue: true
+      - key: DETECTIVE_SEED
+        generateValue: true
+      - key: SCANNER_SEED
+        generateValue: true
+      - key: EXECUTOR_SEED
+        generateValue: true
