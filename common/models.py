@@ -1,5 +1,5 @@
 """ALL inter-agent uagents.Model schemas live here (contract in CLAUDE.md §6)."""
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from uagents import Model
 
@@ -51,6 +51,7 @@ class CommitEvidenceReport(Model):
     offending_diff_snippet: str
     root_cause_explanation: str
     active_ast_imports: List[str]
+    confidence: str = "high"   # "low": no error location, so the commit/file is the LLM's best guess
 
 
 # 3. Orchestrator -> Agent_4
@@ -88,6 +89,8 @@ class VulnerabilityReport(Model):
     cve_findings: List[CVEFinding]
     sast_findings: List[SASTFinding]
     total_reachable_critical: int
+    files_scanned: int = 0          # so "no problems" can never be claimed about code that was not looked at
+    dependencies_scanned: int = 0
 
 
 # 4. Agent_5 <-> Agent_4
@@ -96,6 +99,8 @@ class PatchDraftRequest(Model):
     repo_full_name: str
     commit_evidence: CommitEvidenceReport
     vuln_report: VulnerabilityReport
+    branch: str = "main"
+    problem: str = ""
 
 
 class PatchVettingRequest(Model):
@@ -127,6 +132,7 @@ class ExecuteRemediationCommand(Model):
     payer_wallet: str
     attestation: SecurityApprovalAttestation
     service_reload_webhook: Optional[str] = None
+    branch: str = "main"
 
 
 class RemediationCompletionReport(Model):
@@ -153,3 +159,35 @@ class PatchDraftResult(Model):
     attestation: SecurityApprovalAttestation
     rollback_available: bool
     attempts: int
+    explanation: str = ""
+    no_bug: bool = False                # the Fixer read the code and the reported problem is not there
+    upgrades: Dict[str, str] = {}       # every pinned package this fix changes, with its new version
+
+
+# Web console: web/gateway.py <-> Agent_1, and every agent -> web/gateway.py
+class IncidentRequest(Model):
+    """A structured request from the console. The console creates incident_id, so it knows who owns the incident."""
+    incident_id: str
+    mode: str                  # "diagnose_and_heal" | "security_audit" | "chaos_test"
+    repo_full_name: str
+    branch: str
+    problem: str = ""
+    service_url: str = ""      # optional: without it the agents work from the description alone
+    endpoints: List[str] = []
+
+
+class IncidentUpdate(Model):
+    incident_id: str
+    record_json: str           # Agent_1's full incident record
+
+
+class AgentActivity(Model):
+    incident_id: str
+    agent: str
+    status: str                # "working" | "done" | "failed"
+    text: str
+
+
+# GET http://127.0.0.1:8001/incidents (read-only, the console's heartbeat; not published outside the host)
+class IncidentListResponse(Model):
+    incidents: List[Dict[str, Any]] = []

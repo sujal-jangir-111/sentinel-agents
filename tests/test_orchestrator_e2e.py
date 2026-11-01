@@ -17,12 +17,13 @@ from uagents_core.contrib.protocols.payment import (
 
 from agents import Agent_3, Agent_5, Agent_1, Agent_2, Agent_4
 from common.addresses import address_from_seed
-from common.asi1_client import ASI1Client
+from common.llm_client import ASI1Client
 from common.config import Settings
 from common.github_client import GitHubClient
 from demo_target_app import app as demo
 from tests.bureau_harness import agent_test_kwargs, free_port, run_chat_session
 from tests.fakes import (
+    draft_adding_a_new_finding,
     ASI1_URL, PAYER, PRICE, README_SHA, REPO, TX_GOOD, TX_UNDER, WALLET, FakeWeb, fully_fixed_app_source, fake_verifier, runtime_fixed_app_source,
     smart_llm, standard_chain,
 )
@@ -30,7 +31,7 @@ from tests.fakes import (
 SEEDS = {"orchestrator": "e2e orchestrator seed", "watchdog": "e2e watchdog seed", "detective": "e2e detective seed",
          "scanner": "e2e scanner seed", "executor": "e2e executor seed"}
 ADDRESSES = {k: address_from_seed(v) for k, v in SEEDS.items()}
-SETTINGS = replace(Settings(), demo_repo_full_name=REPO, demo_service_url="", skip_payment=True, patch_max_attempts=3,
+SETTINGS = replace(Settings(), demo_repo_full_name=REPO, demo_service_url="http://demo", skip_payment=True, patch_max_attempts=3,
                    traffic_rpm=120, avg_order_value_usd=40, conversion_rate=0.03, sla_target=0.999)
 PAY_SETTINGS = replace(SETTINGS, skip_payment=False, orchestrator_wallet_address=WALLET, remediation_price_atestfet=PRICE)
 HEAL = f"Diagnose and heal the outage on http://demo for repo {REPO}"
@@ -101,8 +102,8 @@ def order_of(texts: List[str], *needles: str) -> List[int]:
 
 def test_chat_to_approval_with_a_rejected_then_fixed_patch():
     web = FakeWeb()
-    # attempt 1 fixes only the runtime bug (SQL injection remains) -> the real gatekeeper rejects; attempt 2 is clean
-    web.llm = smart_llm([runtime_fixed_app_source(), fully_fixed_app_source()])
+    # attempt 1 introduces eval() -> the real gatekeeper rejects it; attempt 2 is clean
+    web.llm = smart_llm([draft_adding_a_new_finding(), fully_fixed_app_source()])
     texts = run_chat_session(swarm_factory(web, {}), HEAL, approve_when_card_arrives(),
                              lambda t: any("Change authorized" in m for m in t), timeout=120)
 
@@ -165,7 +166,7 @@ def test_security_audit_over_chat_is_read_only():
 
 def test_gatekeeper_failure_reaches_the_user_with_a_rollback_offer():
     web = FakeWeb()
-    web.llm = smart_llm([runtime_fixed_app_source()] * 3)          # never fixes the SQL injection -> 3 rejections
+    web.llm = smart_llm([draft_adding_a_new_finding()] * 3)          # never fixes the SQL injection -> 3 rejections
     answered: List[bool] = []
 
     def respond(texts: List[str]):
@@ -176,7 +177,7 @@ def test_gatekeeper_failure_reaches_the_user_with_a_rollback_offer():
 
     texts = run_chat_session(swarm_factory(web, {}), HEAL, respond, lambda t: any("Change authorized" in m for m in t), timeout=120)
     card = next(t for t in texts if "Sentinel Incident" in t)
-    assert "No safe patch after 3 attempt(s)" in card and "SQL_INJECTION" in card and "Reply **rollback**" in card
+    assert "No safe patch after 3 attempt(s)" in card and "UNSAFE_EVAL" in card and "Reply **rollback**" in card
     assert "ROLLBACK_COMMIT" in texts[-1]
 
 
@@ -252,7 +253,7 @@ def fix_branch_files(web):
 
 def test_full_lifecycle_chat_to_resolved_without_payment():
     web = FakeWeb()
-    web.llm = smart_llm([runtime_fixed_app_source(), fully_fixed_app_source()])
+    web.llm = smart_llm([draft_adding_a_new_finding(), fully_fixed_app_source()])
     assert demo.PATCHED is False
     texts = lifecycle(web, RESOLVED)
     idx = order_of(texts, "returning **HTTP 500**", "Sentinel Incident", "Change authorized", "Pull request opened", "canary probe", "RESOLVED")
@@ -287,7 +288,7 @@ def test_full_lifecycle_with_dorado_payment_ends_resolved_with_the_tx_in_pr_and_
 
 def test_rollback_lifecycle_restores_the_previous_file_and_recovers():
     web = FakeWeb()
-    web.llm = smart_llm([runtime_fixed_app_source()] * 3)                                  # never fixes the SQL injection
+    web.llm = smart_llm([draft_adding_a_new_finding()] * 3)                                  # never fixes the SQL injection
     web.github.ref_files[(README_SHA, "app.py")] = runtime_fixed_app_source()              # the file before the suspect commit
     answered: List[bool] = []
 

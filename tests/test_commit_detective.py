@@ -6,7 +6,7 @@ import pytest
 
 from agents.Agent_3 import CommitDetective, create_agent
 from common import commit_scoring as cs
-from common.asi1_client import ASI1Client
+from common.llm_client import ASI1Client
 from common.github_client import ChangedFile, CommitInfo, GitHubClient
 from common.models import AgentErrorReport, CommitCorrelationRequest, CommitEvidenceReport
 from tests.bureau_harness import agent_test_kwargs, run_roundtrip

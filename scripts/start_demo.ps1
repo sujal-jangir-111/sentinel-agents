@@ -5,6 +5,7 @@
 
 .EXAMPLE
   .\scripts\start_demo.ps1                 # demo app + 5 agents (payment required)
+  .\scripts\start_demo.ps1 -Web            # web console, one supervised window: demo app + 5 agents (local, no payment) + http://127.0.0.1:8080
   .\scripts\start_demo.ps1 -SkipPayment    # dev only: skip the 0.1 FET payment (approval in chat still required)
   .\scripts\start_demo.ps1 -NoDemoApp      # agents only (target is deployed elsewhere)
   .\scripts\start_demo.ps1 -Stop           # close everything this script started
@@ -16,6 +17,7 @@ param(
     [switch]$NoDemoApp,
     [switch]$Stop,
     [switch]$Local,
+    [switch]$Web,
     [int]$StaggerSeconds = 3
 )
 
@@ -29,8 +31,11 @@ if ($Stop) {
     foreach ($line in Get-Content $pidFile) {
         $parts = $line -split "\|"
         if ($parts.Count -lt 2) { continue }
+        # A window closed by hand must not stop the rest, and Windows may have reused its PID for something else
+        $window = Get-Process -Id $parts[0] -ErrorAction SilentlyContinue
+        if (-not $window -or $window.ProcessName -ne "powershell") { Write-Host "$($parts[1]) was already closed"; continue }
         # /T also closes the python process running inside that window; only PIDs this script recorded are touched
-        & taskkill.exe /PID $parts[0] /T /F 2>$null | Out-Null
+        & taskkill.exe /PID $parts[0] /T /F | Out-Null
         Write-Host "Stopped $($parts[1]) (pid $($parts[0]))"
     }
     Remove-Item $pidFile -Force
@@ -49,8 +54,10 @@ foreach ($line in Get-Content (Join-Path $root ".env")) {
 }
 function Need($name) { if (-not $envMap[$name]) { Write-Warning "$name is empty in .env" ; return $false } ; return $true }
 $ok = $true
-foreach ($n in @("ORCHESTRATOR_SEED","WATCHDOG_SEED","DETECTIVE_SEED","SCANNER_SEED","EXECUTOR_SEED","GITHUB_TOKEN","ASI1_API_KEY","DEMO_ADMIN_TOKEN","DEMO_REPO_FULL_NAME")) { if (-not (Need $n)) { $ok = $false } }
+foreach ($n in @("ORCHESTRATOR_SEED","WATCHDOG_SEED","DETECTIVE_SEED","SCANNER_SEED","EXECUTOR_SEED","GITHUB_TOKEN","DEMO_ADMIN_TOKEN","DEMO_REPO_FULL_NAME")) { if (-not (Need $n)) { $ok = $false } }
+if (-not $envMap["GEMINI_API_KEY"] -and -not $envMap["ASI1_API_KEY"] -and -not $envMap["GROQ_API_KEY"] -and -not $env:GROQ_API_KEY) { Write-Warning "Set GROQ_API_KEY (or GEMINI_API_KEY / ASI1_API_KEY) in .env for the LLM"; $ok = $false }
 if ($envMap["DEMO_REPO_FULL_NAME"] -like "your-org/*") { Write-Warning "DEMO_REPO_FULL_NAME is still the placeholder"; $ok = $false }
+if ($Web) { $Local = $true; $SkipPayment = $true }   # the web console talks to Agent_1 over local HTTP and has no payment step
 $payment = (-not $SkipPayment) -and ($envMap["SKIP_PAYMENT"] -ne "true")
 if ($payment -and (-not $envMap["ORCHESTRATOR_WALLET_ADDRESS"] -or $envMap["ORCHESTRATOR_WALLET_ADDRESS"] -like "fetch1...*")) {
     Write-Warning "ORCHESTRATOR_WALLET_ADDRESS is not set; the payment step will fail. Set it, or use -SkipPayment for a dry run."
@@ -71,6 +78,29 @@ function Launch($title, $command) {
     $script:started += "$($p.Id)|$title"
     Set-Content -Path $pidFile -Value $script:started
     Write-Host "Started $title (pid $($p.Id))"
+}
+
+if ($Web) {
+    # One supervised window instead of seven: a stopped agent comes back by itself (scripts/run_stack.py)
+    $dist = Join-Path $root "frontend\dist\index.html"
+    if (-not (Test-Path $dist)) {
+        Write-Host "Building the web console (first run)..."
+        Push-Location (Join-Path $root "frontend")
+        if (-not (Test-Path "node_modules")) { & npm install --no-fund --no-audit | Out-Null }
+        & npm run build | Out-Null
+        Pop-Location
+    }
+    Launch "Sentinel :8080" "& '$py' -m scripts.run_stack"
+    Write-Host "Waiting for the agents..."
+    $online = $false
+    for ($i = 0; $i -lt 60 -and -not $online; $i++) {
+        Start-Sleep -Seconds 1
+        try { $online = (Invoke-RestMethod -Uri "http://127.0.0.1:8080/api/health" -TimeoutSec 2).agents_online } catch { }
+    }
+    if ($online) { Write-Host "All agents online. Web console: http://127.0.0.1:8080" }
+    else { Write-Warning "The agents did not come online within 60 seconds. Check the 'Sentinel :8080' window." }
+    Write-Host "Stop everything with:  .\scripts\start_demo.ps1 -Stop"
+    exit 0
 }
 
 if (-not $NoDemoApp) {
@@ -100,11 +130,5 @@ if ($Local) {
     Write-Host "Stop everything with:  .\scripts\start_demo.ps1 -Stop"
     exit 0
 }
-Write-Host "NEXT: connect each agent's mailbox (all 5, see README 'Mailboxes'). Inspector links:"
-& $py -m scripts.show_addresses | ForEach-Object {
-    $cols = $_ -split "\s+"
-    $addr = $cols[-1]; $port = $cols[-2]
-    Write-Host ("  {0}`n    https://agentverse.ai/inspect/?uri=http%3A//127.0.0.1%3A{1}&address={2}" -f ($_ -replace "\s+agent1q.*$", ""), $port, $addr)
-}
-Write-Host ""
+Write-Host "NEXT: connect all 5 agents' mailboxes in the Agentverse Inspector."
 Write-Host "Stop everything with:  .\scripts\start_demo.ps1 -Stop"

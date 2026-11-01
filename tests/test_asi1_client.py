@@ -2,10 +2,12 @@ import json
 import os
 from typing import Callable, List
 
+import json
+
 import httpx
 import pytest
 
-from common.asi1_client import ASI1Client, LLMError, parse_json_object, truncate
+from common.llm_client import ASI1Client, LLMClient, LLMError, parse_json_object, truncate
 from common.models import PatchDraftResult
 
 URL = "https://asi.test/v1/chat/completions"
@@ -84,7 +86,7 @@ async def test_secrets_are_masked_before_sending():
 async def test_missing_api_key_never_sends():
     client, seen, http = make(lambda r: completion("x"), key="")
     async with http:
-        with pytest.raises(LLMError, match="ASI1_API_KEY"):
+        with pytest.raises(LLMError, match="_API_KEY is not configured"):
             await client.chat("s", "u")
     assert seen == []
 
@@ -191,3 +193,144 @@ async def test_live_asi1_json_roundtrip():
     async with httpx.AsyncClient() as http:
         out = await ASI1Client(http, api_key=key).chat_json("You are a test.", 'Return {"ok": true}', '{"ok": bool}')
     assert isinstance(out, dict)
+
+
+# ------------------------------------------------------------------ provider selection
+
+def test_gemini_is_the_default_provider_when_its_key_is_set(monkeypatch):
+    from common.config import GEMINI_BASE_URL, get_settings
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "g-key")
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-test")
+    cfg = get_settings()
+    assert (cfg.llm_provider, cfg.llm_api_key, cfg.llm_model, cfg.llm_base_url) == ("gemini", "g-key", "gemini-test", GEMINI_BASE_URL)
+
+
+def test_asi1_provider_can_still_be_selected(monkeypatch):
+    from common.config import ASI1_BASE_URL, get_settings
+    monkeypatch.setenv("GEMINI_API_KEY", "g-key")
+    monkeypatch.setenv("LLM_PROVIDER", "asi1")
+    monkeypatch.setenv("ASI1_API_KEY", "a-key")
+    cfg = get_settings()
+    assert (cfg.llm_provider, cfg.llm_api_key, cfg.llm_base_url, cfg.llm_key_env) == ("asi1", "a-key", ASI1_BASE_URL, "ASI1_API_KEY")
+
+
+async def test_groq_failing_to_parse_its_own_output_is_retried(monkeypatch):
+    """Live: Groq answered 400 output_parse_failed on 2 calls of 4 for a prompt that then worked."""
+    waits = []
+
+    async def sleep(seconds):
+        waits.append(seconds)
+
+    monkeypatch.setattr("common.http_retry._sleep", sleep)
+    answers = iter([httpx.Response(400, json={"error": {"code": "output_parse_failed"}}), completion("ok")])
+    client, seen, http = make(lambda r: next(answers))
+    async with http:
+        assert await client.chat("s", "u") == "ok"
+    assert len(seen) == 2 and waits == [0.5]
+
+
+async def test_a_short_rate_limit_is_waited_out_and_a_daily_one_is_not(monkeypatch):
+    waits = []
+
+    async def sleep(seconds):
+        waits.append(seconds)
+
+    monkeypatch.setattr("common.http_retry._sleep", sleep)
+    short = iter([httpx.Response(429, headers={"retry-after": "7"}, json={}), completion("ok")])
+    client, _, http = make(lambda r: next(short))
+    async with http:
+        assert await client.chat("s", "u") == "ok"
+    assert waits == [7.0]
+    waits.clear()
+    client, _, http = make(lambda r: httpx.Response(429, headers={"retry-after": "53469"}, json={}))
+    async with http:
+        with pytest.raises(LLMError):
+            await client.chat("s", "u")
+    assert all(w < 20 for w in waits)
+
+
+def test_the_code_budget_fits_the_providers_limit(monkeypatch):
+    from common.config import get_settings
+    monkeypatch.delenv("LLM_CONTEXT_CHARS", raising=False)
+    monkeypatch.setenv("LLM_PROVIDER", "groq")
+    assert get_settings().llm_context_chars == 6_000
+    monkeypatch.setenv("LLM_PROVIDER", "gemini")
+    monkeypatch.setenv("LLM_CONTEXT_CHARS", "9000")
+    assert get_settings().llm_context_chars == 9000
+
+
+def test_groq_provider_uses_the_chosen_model_for_everything(monkeypatch):
+    from common.config import GROQ_BASE_URL, get_settings
+    monkeypatch.setenv("LLM_PROVIDER", "groq")
+    monkeypatch.setenv("GROQ_API_KEY", "g-key")
+    monkeypatch.delenv("GROQ_MODEL", raising=False)
+    monkeypatch.delenv("GROQ_ASSISTANT_MODEL", raising=False)
+    monkeypatch.delenv("GROQ_FALLBACK_MODEL", raising=False)
+    cfg = get_settings()
+    assert (cfg.llm_api_key, cfg.llm_base_url, cfg.llm_key_env) == ("g-key", GROQ_BASE_URL, "GROQ_API_KEY")
+    assert cfg.llm_model == cfg.llm_assistant_model == "openai/gpt-oss-20b" and cfg.llm_fallback_model == ""
+
+
+async def test_a_models_reasoning_is_not_sent_back():
+    client, seen, http = make(lambda r: completion("ok"))
+    async with http:
+        await client.complete([{"role": "assistant", "content": "x", "reasoning": "private thoughts"}])
+    assert "reasoning" not in json.loads(seen[0].content)["messages"][0]
+
+
+async def test_missing_gemini_key_names_the_right_variable(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "gemini")
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    async with httpx.AsyncClient() as http:
+        with pytest.raises(LLMError, match="GEMINI_API_KEY is not configured"):
+            await LLMClient(http).chat("s", "u")
+
+
+# ------------------------------------------------------------------ fallback model
+
+def _by_model(answers):
+    """Client answering per requested model; records the order of models tried."""
+    tried = []
+
+    def handler(request):
+        model = json.loads(request.content)["model"]
+        tried.append(model)
+        status = answers[model]
+        return completion("ok") if status == 200 else httpx.Response(status, json={"error": "x"})
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler)), tried
+
+
+def _client(http):
+    return LLMClient(http, api_key="k", model="main", base_url=URL, fallback_model="lite")
+
+
+async def test_overloaded_model_falls_back_once(no_sleep):
+    http, tried = _by_model({"main": 503, "lite": 200})
+    async with http:
+        assert await _client(http).chat("s", "u") == "ok"
+    assert tried == ["main", "lite"]                # no time wasted retrying the overloaded model
+
+
+async def test_retired_model_falls_back_without_retrying(no_sleep):
+    http, tried = _by_model({"main": 404, "lite": 200})
+    async with http:
+        await _client(http).chat("s", "u")
+    assert tried == ["main", "lite"]
+
+
+async def test_bad_key_does_not_fall_back(no_sleep):
+    http, tried = _by_model({"main": 401, "lite": 200})
+    async with http:
+        with pytest.raises(LLMError, match="HTTP 401"):
+            await _client(http).chat("s", "u")
+    assert tried == ["main"]
+
+
+async def test_both_models_down_raises_llm_error(no_sleep):
+    http, tried = _by_model({"main": 503, "lite": 503})
+    async with http:
+        with pytest.raises(LLMError):
+            await _client(http).chat("s", "u")
+    assert tried == ["main"] + ["lite"] * 3         # the last resort still gets the full retry policy

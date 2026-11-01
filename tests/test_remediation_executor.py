@@ -6,7 +6,7 @@ import pytest
 from agents import Agent_4
 from agents.Agent_5 import LOOP_TIMEOUT_SECONDS, RemediationExecutor, create_agent
 from common.addresses import address_from_seed
-from common.asi1_client import ASI1Client
+from common.llm_client import ASI1Client
 from common.gatekeeper import attestation_hash
 from common.github_client import GitHubClient
 from common.models import (
@@ -17,6 +17,7 @@ from common.patching import make_unified_diff
 from common.sast_rules import scan_text
 from tests.bureau_harness import agent_test_kwargs, free_port, run_roundtrip
 from tests.fakes import (
+    draft_adding_a_new_finding,
     ASI1_URL, DEMO_FILES, HEAD_SHA, REPO, FakeWeb, checkout_patch, fully_fixed_app_source, llm_reply,
     runtime_fixed_app_source,
 )
@@ -206,7 +207,7 @@ async def test_rejection_feeds_reasons_back_and_second_attempt_is_approved(ctx):
 
 async def test_gives_up_after_max_attempts_and_offers_rollback_only(ctx):
     web = FakeWeb()
-    web.llm = llm_answers(*[runtime_fixed_app_source()] * 3)
+    web.llm = llm_answers(*[draft_adding_a_new_finding()] * 3)
     ex = make_executor(web, max_attempts=3)
     await ex.handle_patch_draft_request(ctx, ORCH, draft_request())
     for n in range(1, 4):
@@ -390,19 +391,19 @@ def test_bureau_patch_approved_on_first_attempt_by_the_real_scanner():
 
 def test_bureau_rejected_then_fixed_across_executor_and_scanner():
     web = FakeWeb()
-    web.llm = llm_answers(runtime_fixed_app_source(), fully_fixed_app_source())  # 1st: SQL injection left in
+    web.llm = llm_answers(draft_adding_a_new_finding(), fully_fixed_app_source())  # 1st: introduces eval()
     result = run_loop(web)
     assert result.attempts == 2 and result.attestation.approved is True
     first_prompt, second_prompt = web.llm_prompts()
     assert "REJECTED" not in first_prompt and "REJECTED" in second_prompt
-    assert "SQL_INJECTION" in second_prompt                      # the real scanner's reason, fed back verbatim
-    assert "?" in result.attestation.patched_code_content and "sku = '{sku}'" not in result.attestation.patched_code_content
+    assert "UNSAFE_EVAL" in second_prompt                        # the real scanner's reason, fed back verbatim
+    assert "eval(" not in result.attestation.patched_code_content
 
 
 def test_bureau_exhausted_attempts_returns_rejection_with_the_scanners_reasons():
     web = FakeWeb()
-    web.llm = llm_answers(*[runtime_fixed_app_source()] * 3)     # never fixes the SQL injection
+    web.llm = llm_answers(*[draft_adding_a_new_finding()] * 3)   # keeps adding eval()
     result = run_loop(web)
     assert result.attempts == 3 and result.attestation.approved is False and result.attestation.attestation_hash == ""
-    assert any(r.startswith("SQL_INJECTION") for r in result.attestation.rejection_reasons)
+    assert any(r.startswith("UNSAFE_EVAL") for r in result.attestation.rejection_reasons)
     assert result.rollback_available is True

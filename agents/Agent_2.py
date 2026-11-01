@@ -10,12 +10,14 @@ from typing import Any, Dict, List, Optional
 import httpx
 from uagents import Agent, Context
 
+from common.activity import DONE, FAILED, report as activity
 from common.addresses import agent_address
 from common.agent_factory import build_agent
 from common.config import get_settings
 from common.logging import configure_console_utf8, log
 from common.models import AgentErrorReport, HealthProbeReport, HealthProbeRequest
 from common.probe import probe_service, summarize
+from common.url_safety import same_host
 
 AGENT_NAME = "Agent_2"
 AGENT_LABEL = "Agent_2"  # display name on Agentverse and in uagents logs
@@ -35,9 +37,11 @@ class Watchdog:
         admin_token: Optional[str] = None,
         orchestrator_address: Optional[str] = None,
         targets: Optional[List[str]] = None,
+        demo_url: Optional[str] = None,
     ) -> None:
         cfg = get_settings()
         self.http = http
+        self.demo_url = cfg.demo_service_url if demo_url is None else demo_url
         self._owns_http = http is None
         self.admin_token = cfg.demo_admin_token if admin_token is None else admin_token
         self.orchestrator_address = orchestrator_address if orchestrator_address is not None else agent_address("orchestrator")
@@ -63,15 +67,21 @@ class Watchdog:
             assert self.http is not None, "http client not initialised"
             log(ctx.logger, msg.incident_id, AGENT_NAME, stage,
                 f"🔍 Probing {len(msg.endpoints)} endpoint(s) on {msg.service_url}")
-            report, chaos_ok = await probe_service(self.http, msg, self.admin_token)
+            await activity(ctx, msg.incident_id, AGENT_NAME, "Checking the service again to confirm the fix" if msg.is_canary_check
+                           else f"Sending test requests to {', '.join(msg.endpoints[:3])}")
+            # The admin token only ever goes to the configured demo service, never to a URL a user typed
+            token = self.admin_token if same_host(msg.service_url, self.demo_url) else ""
+            report, chaos_ok = await probe_service(self.http, msg, token)
             if msg.inject_chaos:
                 log(ctx.logger, msg.incident_id, AGENT_NAME, "chaos",
                     "💥 fault injected" if chaos_ok else "chaos injection failed (continuing with probe)",
                     level="info" if chaos_ok else "warning")
             self._log_report(ctx, report)
+            await activity(ctx, msg.incident_id, AGENT_NAME, self._outcome(report), DONE)
             await ctx.send(sender, report)
         except Exception as exc:  # handlers never raise
             log(ctx.logger, msg.incident_id, AGENT_NAME, stage, f"error: {type(exc).__name__}: {exc}", level="error")
+            await activity(ctx, msg.incident_id, AGENT_NAME, "Could not check the service", FAILED)
             await self._send_error(ctx, sender, msg.incident_id, stage, exc)
 
     # -- continuous mode ---------------------------------------------------------------
@@ -101,6 +111,15 @@ class Watchdog:
             log(ctx.logger, report.incident_id, AGENT_NAME, "poll", "ORCHESTRATOR_SEED not set; alert not delivered", level="warning")
 
     # -- helpers ------------------------------------------------------------------------
+
+    @staticmethod
+    def _outcome(report: HealthProbeReport) -> str:
+        if report.is_healthy:
+            return f"All {len(report.metrics)} test requests succeeded"
+        bad = [m for m in report.metrics if not 200 <= m.status_code < 300]
+        first = bad[0]
+        what = "could not be reached" if first.status_code == 0 else f"returned error {first.status_code}"
+        return f"{first.endpoint} {what} ({len(bad)} of {len(report.metrics)} requests failed)"
 
     def _log_report(self, ctx: Context, report: HealthProbeReport) -> None:
         s = summarize(report.metrics)

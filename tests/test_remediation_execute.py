@@ -18,6 +18,7 @@ from common.patching import make_unified_diff
 from common.remediation import build_pr_body, remaining_findings, webhook_allowed
 from tests.conftest import FakeContext
 from tests.fakes import (
+    draft_adding_a_new_finding,
     DEMO_FILES, HEAD_SHA, MAIN_SHA, OLD_SHA, PAYER, PRICE, README_SHA, REPO, TX_FAILED, TX_GOOD, TX_OTHER, TX_UNDER, WALLET,
     FakeChain, FakeWeb, fake_verifier, fully_fixed_app_source, make_vuln_report, runtime_fixed_app_source, standard_chain,
 )
@@ -48,13 +49,13 @@ class Hook:
         return httpx.Response(self.status, json={"patched": self.status < 400})
 
 
-def settings(skip_payment: bool = True, service_url: str = "") -> Settings:
+def settings(skip_payment: bool = True, service_url: str = "http://demo") -> Settings:
     return replace(Settings(), skip_payment=skip_payment, orchestrator_wallet_address=WALLET, remediation_price_atestfet=PRICE,
                    demo_admin_token=TOKEN, demo_service_url=service_url, demo_repo_full_name=REPO,
                    dorado_explorer_base="https://explore-dorado.fetch.ai/transactions")
 
 
-def build(web=None, hook=None, chain=None, skip_payment=True, service_url=""):
+def build(web=None, hook=None, chain=None, skip_payment=True, service_url="http://demo"):
     web = web or FakeWeb()
     hook = hook or Hook()
     ex = RemediationExecutor(
@@ -252,8 +253,7 @@ async def test_unapproved_or_hashless_attestation_cannot_open_a_fix_pr(ctx):
 
 async def test_patch_with_sast_findings_is_refused_even_if_hashed(ctx):
     ex, web, _ = build()
-    dirty = runtime_fixed_app_source()
-    await refused(ctx, ex, web, command(attestation(patched=dirty)), "SAST")
+    await refused(ctx, ex, web, command(attestation(patched=draft_adding_a_new_finding())), "security findings")
 
 
 async def test_attested_file_must_be_the_incident_file(ctx):

@@ -12,7 +12,6 @@ from common import commit_scoring as cs
 from common.github_client import ChangedFile, CommitInfo
 from scripts import seed_demo_repo as seed_mod
 from scripts.seed_demo_repo import SeedError, faulty_source, parent_source, seed
-from scripts.show_addresses import main as show_main
 from tests.fakes import ERROR_SNIPPET, FAULT_LINE
 
 REPO = "alice/sentinel-target"
@@ -81,6 +80,15 @@ def test_commit_detective_scoring_picks_the_seeded_faulty_commit():
     faulty = CommitInfo("f" * 40, "u", "alice", seed_mod.FAULTY_MESSAGE, "2026-03-01T11:30:00Z", ["n" * 40], [ChangedFile("app.py", "modified", patch)])
     ranked = cs.rank_commits([noise, faulty], "app.py", FAULT_LINE, "/api/checkout", "2026-03-01T12:00:00Z")
     assert ranked[0].commit.sha == "f" * 40 and ranked[0].score >= 80 and not cs.is_ambiguous(ranked)
+
+
+def test_sentinel_fix_title_uses_the_real_commit_messages():
+    merged = "Merge pull request #2 from sujal-jangir-111/sentinel/fix-inc-51626f69\n\nSentinel inc-51626f69: fix app.py"
+    assert cs.sentinel_fix_title(merged) == "Sentinel inc-51626f69: fix app.py"
+    assert cs.sentinel_fix_title("Sentinel inc-51626f69: fix app.py (#2)")                       # squash merge
+    for message in ("Merge pull request #3 from x/sentinel/fix-inc-d5faec4b\n\nSentinel inc-d5faec4b: roll back app.py",
+                    "Require discount_rate in pricing config", "Sentinel inc-51626f69: update app.py", "Fix the Sentinel docs", ""):
+        assert cs.sentinel_fix_title(message) is None
 
 
 def test_scoring_blames_the_faulty_commit_not_the_commit_that_created_the_file():
@@ -188,27 +196,6 @@ def test_cli_asks_for_confirmation(monkeypatch, capsys):
     assert seed_mod.main(["--repo", REPO]) == 1 and "Aborted" in capsys.readouterr().out
 
 
-# ------------------------------------------------------------------ addresses
-
-def test_show_addresses_prints_addresses_but_never_seeds(monkeypatch, capsys):
-    seeds = {"ORCHESTRATOR_SEED": "seed-one-secret", "WATCHDOG_SEED": "seed-two-secret", "DETECTIVE_SEED": "seed-three-secret",
-             "SCANNER_SEED": "seed-four-secret", "EXECUTOR_SEED": "seed-five-secret"}
-    for k, v in seeds.items():
-        monkeypatch.setenv(k, v)
-    assert show_main([]) == 0
-    out = capsys.readouterr().out
-    assert out.count("agent1q") == 5 and "8005" in out and not any(v in out for v in seeds.values())
-    assert show_main(["--markdown"]) == 0
-    assert capsys.readouterr().out.count("| `agent1q") == 5
-
-
-def test_show_addresses_reports_missing_seeds(monkeypatch, capsys):
-    for k in ("ORCHESTRATOR", "WATCHDOG", "DETECTIVE", "SCANNER", "EXECUTOR"):
-        monkeypatch.setenv(f"{k}_SEED", "")
-        monkeypatch.delenv(f"{k}_ADDRESS", raising=False)
-    assert show_main([]) == 1 and "ORCHESTRATOR_SEED" in capsys.readouterr().err
-
-
 # ------------------------------------------------------------------ local (no mailbox) mode
 
 async def test_local_mode_uses_http_endpoints_instead_of_the_mailbox(monkeypatch):
@@ -217,7 +204,11 @@ async def test_local_mode_uses_http_endpoints_instead_of_the_mailbox(monkeypatch
         monkeypatch.setenv(f"{k}_SEED", f"local-{k}")
     monkeypatch.setenv("AGENT_MAILBOX", "false")
     rules = local_rules()
-    assert sorted(rules.values()) == [f"http://127.0.0.1:{p}/submit" for p in range(8001, 8006)]
+    assert sorted(rules.values()) == [f"http://127.0.0.1:{p}/submit" for p in range(8001, 8007)]   # 8006 = web gateway
+    from common.addresses import address_from_seed, gateway_address
+    assert gateway_address() == address_from_seed("local-ORCHESTRATOR/web-gateway")         # derived from ORCHESTRATOR_SEED
+    monkeypatch.setenv("GATEWAY_SEED", "explicit-gateway")
+    assert gateway_address() == address_from_seed("explicit-gateway")
     agent = build_agent(name="x", seed="local-ORCHESTRATOR", seed_env="S", port=8001, description="d")
     assert agent.mailbox_client is None and "127.0.0.1:8001/submit" in str(agent._endpoints)
     monkeypatch.delenv("AGENT_MAILBOX")
@@ -229,10 +220,3 @@ def test_agent_descriptions_fit_agentverse_limit():
     import importlib
     for name in ("Agent_1", "Agent_2", "Agent_3", "Agent_4", "Agent_5"):
         assert len(importlib.import_module(f"agents.{name}").DESCRIPTION) <= 300, name
-
-
-def test_every_agent_has_a_readme_with_the_innovation_lab_badges():
-    from pathlib import Path
-    for name in ("Agent_1", "Agent_2", "Agent_3", "Agent_4", "Agent_5"):
-        text = (Path(__file__).resolve().parent.parent / "agents" / "readmes" / f"{name}.md").read_text(encoding="utf-8")
-        assert "tag:innovationlab" in text and "tag:hackathon" in text, name

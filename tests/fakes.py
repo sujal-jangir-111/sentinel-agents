@@ -128,6 +128,8 @@ class FakeGitHub:
         if rest == "pulls":
             head = request.url.params.get("head", "").split(":", 1)[-1]
             return httpx.Response(200, json=[p for p in self.pulls if p["head"] == head])
+        if rest.startswith("git/trees/"):
+            return httpx.Response(200, json={"tree": [{"path": p, "type": "blob"} for p in self.files]})
         if rest == "commits":
             return httpx.Response(200, json=[{k: v for k, v in c.items() if k != "files"} for c in self.commits])
         if rest.startswith("commits/"):
@@ -227,7 +229,7 @@ class FakeWeb:
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
-        handler = {"api.github.com": self.github, "api.osv.dev": self.osv, "api.asi1.ai": self.llm}.get(request.url.host)
+        handler = {"api.github.com": self.github, "api.osv.dev": self.osv, "api.asi1.ai": self.llm}.get(request.url.host)    # pypi.org stays unmocked: a lookup that fails blocks nothing
         if handler is None:
             raise httpx.ConnectError(f"unmocked host {request.url.host}", request=request)
         return handler(request)
@@ -263,6 +265,11 @@ def fully_fixed_app_source() -> str:
     """What a perfect patch looks like: runtime fix + parameterized SQL + env secret + safe_load."""
     from common.patching import fix_unsafe_yaml, harden_secrets
     return fix_unsafe_yaml(harden_secrets(sql_fixed(runtime_fixed_app_source())))
+
+
+def draft_adding_a_new_finding() -> str:
+    """A patch that fixes everything but introduces a security problem the file did not have."""
+    return fully_fixed_app_source().rstrip("\n") + "\n\n\ndef debug(expression: str) -> object:\n    return eval(expression)\n"
 
 
 # ------------------------------------------------------------------ typed message builders (Orchestrator tests)

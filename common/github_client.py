@@ -10,7 +10,7 @@ import base64
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import quote
 
 import httpx
@@ -26,6 +26,12 @@ TIMEOUT_SECONDS = 20.0
 MANIFEST_FILES = ("requirements.txt", "pyproject.toml", "package.json", "Dockerfile")
 
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+
+SOURCE_SUFFIXES = (".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".java", ".rb", ".php", ".rs", ".cs", ".kt", ".swift", ".c", ".cpp", ".h")
+SECONDARY_DIRS = {"test", "tests", "docs", "doc", "examples", "example", "benchmarks", "migrations"}
+PYTHON_FILE_CAP = 50
+SKIPPED_DIRS = {"node_modules", "vendor", "dist", "build", "venv", ".venv", "__pycache__", "site-packages", "third_party", ".git"}
 
 
 class GitHubError(Exception):
@@ -158,6 +164,26 @@ class GitHubClient:
 
     # ------------------------------------------------------------------ reads
 
+    async def get_repo(self, repo: str) -> Optional[Dict[str, Any]]:
+        """{full_name, default_branch, private} of a repository this token can read, or None."""
+        self._check_repo(repo)
+        try:
+            data = self._json(await self._api("GET", f"/repos/{repo}"))
+        except GitHubNotFound:
+            return None
+        return {"full_name": data.get("full_name") or repo, "default_branch": data.get("default_branch") or "main",
+                "private": bool(data.get("private"))}
+
+    async def list_source_paths(self, repo: str, ref: str, cap: int = 5000) -> List[str]:
+        """Source files anywhere in the repo, without vendored or generated folders. [] if the tree is unreadable."""
+        self._check_repo(repo)
+        try:
+            data = self._json(await self._api("GET", f"/repos/{repo}/git/trees/{quote(ref, safe='')}", params={"recursive": "1"}))
+        except GitHubNotFound:
+            return []
+        paths = [e["path"] for e in data.get("tree") or [] if e.get("type") == "blob" and _is_source(e.get("path", ""))]
+        return paths[:cap]
+
     async def list_commits(self, repo: str, branch: str = "main", per_page: int = 5) -> List[CommitInfo]:
         """Most recent commits on `branch` (list endpoint carries no file patches)."""
         self._check_repo(repo)
@@ -208,11 +234,15 @@ class GitHubClient:
         return {f.path: f.text for f in files if f is not None}
 
     async def fetch_python_sources(
-        self, repo: str, ref: Optional[str] = None, cap: int = 30, dirs: Iterable[str] = ("", "app", "src")
+        self, repo: str, ref: Optional[str] = None, cap: int = PYTHON_FILE_CAP, dirs: Iterable[str] = ("", "app", "src")
     ) -> Dict[str, str]:
-        """`.py` files at the repo root and in app/ and src/ (non-recursive), at most `cap` files."""
-        listings = await asyncio.gather(*(self.list_directory(repo, d, ref) for d in dirs))
-        paths = [e["path"] for entries in listings for e in entries if e["type"] == "file" and e["name"].endswith(".py")]
+        """`.py` files wherever they live (real projects keep code in src/<package>/), application code before tests,
+        at most `cap` files. `dirs` is only the fallback for a repository whose tree cannot be listed."""
+        tree = await self.list_source_paths(repo, ref) if ref else []
+        paths = sorted((p for p in tree if p.endswith(".py")), key=_python_priority)
+        if not paths:
+            listings = await asyncio.gather(*(self.list_directory(repo, d, ref) for d in dirs))
+            paths = [e["path"] for entries in listings for e in entries if e["type"] == "file" and e["name"].endswith(".py")]
         files = await asyncio.gather(*(self.get_file(repo, p, ref) for p in paths[:cap]))
         return {f.path: f.text for f in files if f is not None}
 
@@ -263,6 +293,18 @@ class GitHubClient:
         if not isinstance(data, list) or not data:
             return None
         return {"number": data[0].get("number"), "html_url": data[0].get("html_url", "")}
+
+
+def _is_source(path: str) -> bool:
+    parts = path.split("/")
+    return path.lower().endswith(SOURCE_SUFFIXES) and not SKIPPED_DIRS.intersection(p.lower() for p in parts[:-1])
+
+
+def _python_priority(path: str) -> Tuple[bool, int, str]:
+    """Application code first, then shallow paths: when a large repo hits the cap, tests and docs are what get dropped."""
+    parts = path.lower().split("/")
+    secondary = bool(SECONDARY_DIRS.intersection(parts[:-1])) or parts[-1].startswith("test_")
+    return secondary, len(parts), path
 
 
 def blob_url(repo: str, branch: str, path: str) -> str:

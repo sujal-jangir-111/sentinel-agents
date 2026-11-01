@@ -118,6 +118,17 @@ def build_incident_card(
     return "\n\n".join(parts)
 
 
+def build_already_fixed(ev: CommitEvidenceReport, fix_title: str) -> str:
+    return (f"**Nothing to patch.** The service is still failing, but the newest change to this code is Sentinel's own "
+            f"fix: [`{short_sha(ev.suspect_commit_sha)}`]({ev.suspect_commit_url}), _{fix_title}_. So `main` already has "
+            "the fix and the running service has not deployed it. Patching again has nothing to change, and a rollback "
+            "would only undo the fix, so I stopped here.")
+
+
+ALREADY_FIXED_HINT = ("Redeploy the service from `main`. The bundled demo app always runs its own local code, so to "
+                      "repeat the demo rebuild its history: `python -m scripts.seed_demo_repo --reset`.")
+
+
 def build_audit_report(incident_id: str, repo: str, ev: CommitEvidenceReport, vuln: VulnerabilityReport) -> str:
     reachable = [f for f in vuln.cve_findings if f.is_reachable_in_ast]
     return "\n\n".join([

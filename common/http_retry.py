@@ -26,11 +26,12 @@ async def send_with_retry(
     error_cls: Type[Exception],
     label: str,
     wait_hint: Optional[Callable[[httpx.Response], Optional[float]]] = None,
+    attempts: int = MAX_ATTEMPTS,
     **kwargs: Any,
 ) -> httpx.Response:
     delay = BACKOFF_SECONDS
     last = "unknown error"
-    for attempt in range(MAX_ATTEMPTS):
+    for attempt in range(attempts):
         wait = delay
         try:
             resp = await client.request(method, url, **kwargs)
@@ -45,7 +46,7 @@ async def send_with_retry(
                 last = f"HTTP {resp.status_code}"
             else:
                 return resp
-        if attempt < MAX_ATTEMPTS - 1:
+        if attempt < attempts - 1:
             await _sleep(wait)
             delay *= 2
-    raise error_cls(f"{label} failed after {MAX_ATTEMPTS} attempts ({last})")
+    raise error_cls(f"{label} failed after {attempts} attempts ({last})")

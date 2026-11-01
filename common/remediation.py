@@ -4,18 +4,17 @@ Pure functions plus two small async helpers (GitHub publish, hotfix webhook) so 
 and everything is unit-testable offline.
 """
 import json
-from typing import Any, Callable, Dict, Iterable, List, Tuple
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlsplit
 
 import httpx
 
 from common.config import Settings
 from common.dorado import DoradoVerifier, explorer_url
-from common.gatekeeper import attestation_hash
+from common.gatekeeper import attestation_hash, check_sast
 from common.github_client import FIX_BRANCH_PREFIX, GitHubClient, GitHubError, blob_url
 from common.models import CVEFinding, ExecuteRemediationCommand, RemediationCompletionReport
 from common.osv_client import normalize_name, parse_requirements
-from common.sast_rules import scan_text
 from common.sbom_generator import build_sbom
 
 HOTFIX_PATH = "/admin/apply-hotfix"
@@ -144,10 +143,16 @@ async def run_remediation(
     cmd: ExecuteRemediationCommand, ctx: Dict[str, Any], *, gh: GitHubClient, http: httpx.AsyncClient,
     verifier: DoradoVerifier, cfg: Settings, scanner_address: str, tx_used: Callable[[str], bool],
     mark_tx: Callable[[str], None], release_tx: Callable[[str], None],
+    progress: Optional[Callable[[str], Awaitable[None]]] = None,
 ) -> RemediationCompletionReport:
     """Verify -> branch -> commit patch + manifest + SBOM -> PR -> hotfix webhook. Order matters: every refusal happens
     before the first GitHub write (CLAUDE.md §15: no PR without an approved attestation AND a verified, unused tx)."""
-    inc, repo, att = cmd.incident_id, cmd.repo_full_name, cmd.attestation
+    inc, repo, att, base = cmd.incident_id, cmd.repo_full_name, cmd.attestation, cmd.branch
+
+    async def step(text: str) -> None:
+        if progress:
+            await progress(text)
+
     rollback = cmd.action_type == "ROLLBACK_COMMIT"
     if cmd.action_type not in ("OPEN_PR_AND_HOTFIX", "ROLLBACK_COMMIT"):
         raise ExecutionRefused(f"unknown action_type {cmd.action_type!r}")
@@ -163,8 +168,9 @@ async def run_remediation(
             raise ExecutionRefused("the security attestation is missing or does not verify against the Agent_4's approval")
         if att.target_file != target:
             raise ExecutionRefused("the attested file is not the file this incident is about")
-        if scan_text(target, att.patched_code_content):
-            raise ExecutionRefused("the attested patch still contains SAST findings")
+        current = await gh.get_file(repo, target, base)
+        if check_sast(target, att.patched_code_content, current.text if current else None):
+            raise ExecutionRefused("the attested patch adds security findings")
 
     tx = (cmd.dorado_tx_hash or "").strip().upper()
     reserved = False
@@ -191,20 +197,24 @@ async def run_remediation(
             old = await gh.get_file(repo, target, commit.parents[0]) if commit.parents else None
             if old is None:
                 raise ExecutionRefused("the pre-incident version of the file could not be fetched")
-            requirements = (await gh.get_file(repo, "requirements.txt", "main"))
+            requirements = (await gh.get_file(repo, "requirements.txt", base))
             requirements_txt = requirements.text if requirements else ""
             files = {target: old.text}
             title = f"Sentinel {inc}: roll back {target} to its pre-incident version"
         else:
             requirements_txt = att.updated_requirements_txt
-            files = {target: att.patched_code_content, "requirements.txt": requirements_txt}
+            files = {target: att.patched_code_content}
+            if requirements_txt.strip():    # a repo without requirements.txt must not gain an empty one
+                files["requirements.txt"] = requirements_txt
             title = f"Sentinel {inc}: fix {target}"
         findings = [CVEFinding(**f) for f in ctx["cves"]]
         files[SBOM_PATH] = sbom_json(requirements_txt, repo, inc, findings)
         sbom_url = blob_url(repo, branch, SBOM_PATH)
         body = build_pr_body(inc, ctx, cmd.action_type, "" if rollback else att.attestation_hash, tx, explorer,
                              cmd.payer_wallet, sbom_url, requirements_txt)
-        pr_url, branch = await publish_fix(gh, repo, inc, files, title, body)
+        await step(f"Creating a branch and committing {len(files)} file(s)")
+        pr_url, branch = await publish_fix(gh, repo, inc, files, title, body, base)
+        await step("Pull request opened")
     except BaseException:
         if reserved:
             release_tx(tx)                # nothing was opened, so the payment may authorize a retry
@@ -213,7 +223,7 @@ async def run_remediation(
     redeploy, note = False, "no reload webhook was requested"
     hook = cmd.service_reload_webhook
     if hook:
-        if not webhook_allowed(hook, cfg.demo_service_url):
+        if not (cfg.demo_service_url and webhook_allowed(hook, cfg.demo_service_url)):
             note = "the reload webhook was refused (only the demo /admin/apply-hotfix endpoint on the target service is allowed)"
         else:
             redeploy, note = await trigger_webhook(http, hook, cfg.demo_admin_token)

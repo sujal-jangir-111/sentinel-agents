@@ -11,6 +11,7 @@ request and returns. States:
 import json
 import time
 import uuid
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 
@@ -24,17 +25,19 @@ from uagents_core.contrib.protocols.payment import (
 )
 
 from common import incident_card as card
-from common.addresses import agent_address
+from common.activity import DONE, report as activity
+from common.addresses import agent_address, gateway_address
 from common.agent_factory import build_agent
-from common.asi1_client import ASI1Client, LLMError
+from common.llm_client import LLMClient, LLMError
 from common.blast_radius import compute_blast_radius
+from common.commit_scoring import sentinel_fix_title
 from common.config import Settings, get_settings
 from common.dorado import DENOM, DoradoVerifier, explorer_url, format_fet
 from common.intent import MODES, Intent, extract_repo, extract_url, parse_intent
 from common.logging import configure_console_utf8, log
 from common.models import (
     AgentErrorReport, CommitCorrelationRequest, CommitEvidenceReport, ExecuteRemediationCommand, HealthProbeReport,
-    HealthProbeRequest, PatchDraftRequest, PatchDraftResult, RemediationCompletionReport, SecurityApprovalAttestation,
+    HealthProbeRequest, IncidentListResponse, IncidentRequest, IncidentUpdate, PatchDraftRequest, PatchDraftResult, RemediationCompletionReport, SecurityApprovalAttestation,
     VulnerabilityReport, VulnerabilityScanRequest,
 )
 from common.osv_client import count_reachable
@@ -49,7 +52,8 @@ DESCRIPTION = (
     "security-vet a fix, and wait for your approval. Chat with me on ASI:One (Fetch-A-Thon 3.0)."
 )
 FINAL_STATES = {"RESOLVED", "FAILED", "CANCELLED"}
-STAGE_TIMEOUTS = {"PROBING": 60.0, "CORRELATING": 60.0, "SCANNING": 60.0, "PATCHING": 120.0, "EXECUTING": 120.0, "VERIFYING": 60.0}
+STAGE_TIMEOUTS = {"PROBING": 60.0, "CORRELATING": 120.0, "SCANNING": 60.0, "PATCHING": 180.0, "EXECUTING": 120.0, "VERIFYING": 60.0}
+WEB = "web"    # incidents started from the web console (inc["source"])
 APPROVAL_TIMEOUT = 1800.0
 MAX_PAYMENT_FAILURES = 3                   # definitive verification failures before the incident is cancelled
 PAYMENT_BACKDATE = timedelta(minutes=2)    # tolerated clock skew when checking a tx is newer than the request
@@ -75,16 +79,18 @@ class Orchestrator:
     def __init__(
         self,
         addresses: Optional[Dict[str, Optional[str]]] = None,
-        llm: Optional[ASI1Client] = None,
+        llm: Optional[LLMClient] = None,
         skip_payment: Optional[bool] = None,
         settings: Optional[Settings] = None,
         clock: Callable[[], float] = time.time,
         stage_timeouts: Optional[Dict[str, float]] = None,
         approval_timeout: float = APPROVAL_TIMEOUT,
         verifier: Optional[DoradoVerifier] = None,
+        gateway: Optional[str] = None,
     ) -> None:
         keys = ("watchdog", "detective", "scanner", "executor")
         self.addresses = {k: (addresses or {}).get(k) if addresses is not None else agent_address(k) for k in keys}
+        self.gateway = gateway if gateway is not None else (gateway_address() if addresses is None else None)
         self.llm, self._http = llm, None
         self._settings, self._skip_payment = settings, skip_payment
         self.clock = clock
@@ -109,7 +115,7 @@ class Orchestrator:
     async def startup(self, ctx: Context) -> None:
         if self.llm is None:
             self._http = httpx.AsyncClient(timeout=30)
-            self.llm = ASI1Client(self._http)
+            self.llm = LLMClient(self._http)
         ctx.logger.info(f"Address: {ctx.agent.address}")
         log(ctx.logger, "-", AGENT_NAME, "startup",
             f"✅ ready (payment {'SKIPPED (dev)' if self.skip_payment else 'required'})")
@@ -146,9 +152,14 @@ class Orchestrator:
         if not inc.get("user"):
             return  # headless (watchdog-raised) incident: the next chat message claims it
         try:
-            await ctx.send(inc["user"], make_chat(text, end))
+            await ctx.send(inc["user"], self._web_update(inc) if inc.get("source") == WEB else make_chat(text, end))
         except Exception as exc:
             log(ctx.logger, inc["incident_id"], AGENT_NAME, "chat", f"could not reach user: {exc}", level="error")
+
+    @staticmethod
+    def _web_update(inc: Dict[str, Any]) -> IncidentUpdate:
+        """The console renders its own cards from the record, so it gets data rather than this agent's Markdown."""
+        return IncidentUpdate(incident_id=inc["incident_id"], record_json=json.dumps(inc))
 
     async def _send(self, ctx: Context, key: str, message: Any) -> None:
         address = self.addresses.get(key)
@@ -169,7 +180,7 @@ class Orchestrator:
 
     async def _fail(self, ctx: Context, inc: Dict[str, Any], what: str, hint: str = "") -> None:
         self._set_state(inc, "FAILED")
-        inc["last_note"] = what
+        inc["last_note"], inc["hint"] = what, hint
         self._put(ctx, inc)
         log(ctx.logger, inc["incident_id"], AGENT_NAME, "failed", what, level="error")
         paid = (f"\n\n💳 Your payment [`{inc['dorado_tx_hash'][:12]}…`]({explorer_url(self.cfg.dorado_explorer_base, inc['dorado_tx_hash'])}) "
@@ -225,6 +236,85 @@ class Orchestrator:
         repo, url = extract_repo(str(data.get("repo_full_name") or "")), extract_url(str(data.get("service_url") or ""))
         return Intent(mode=mode, repo=repo, url=url) if mode in MODES else None
 
+    # -- incidents started from the web console -------------------------------------------------------
+
+    async def handle_incident_request(self, ctx: Context, sender: str, req: IncidentRequest) -> None:
+        """The console's structured request. Unlike chat, nothing here falls back to a configured repo or URL."""
+        inc_id = req.incident_id
+        try:
+            if not self.gateway or sender != self.gateway:
+                log(ctx.logger, inc_id, AGENT_NAME, "guard", f"ignoring request from unexpected sender {sender[:16]}…", level="warning")
+                return
+            if self._load(ctx, inc_id) is not None:
+                return  # duplicate delivery
+            inc = {"incident_id": inc_id, "user": sender, "session": "", "mode": req.mode, "repo": req.repo_full_name,
+                   "branch": req.branch, "problem": req.problem, "service_url": req.service_url,
+                   "endpoints": req.endpoints, "created_at": self.clock(), "source": WEB}
+            log(ctx.logger, inc_id, AGENT_NAME, "start", f"🔍 {req.mode} for {req.repo_full_name}@{req.branch}")
+            if req.service_url:
+                self._set_state(inc, "PROBING")
+                self._put(ctx, inc)
+                await activity(ctx, inc_id, AGENT_NAME, "Asked Health Checker to test the live service")
+                await self._say(ctx, inc, "")
+                probe = HealthProbeRequest(incident_id=inc_id, service_url=req.service_url, inject_chaos=req.mode == "chaos_test")
+                await self._send(ctx, "watchdog", probe.copy(update={"endpoints": req.endpoints}) if req.endpoints else probe)
+                return
+            await self._correlate_web(ctx, inc, "", "" if req.mode == "security_audit" else req.problem, _now_iso())
+        except Exception as exc:
+            await self._pipeline_error(ctx, inc_id, "start", exc)
+
+    async def _correlate_web(self, ctx: Context, inc: Dict[str, Any], endpoint: str, evidence: Optional[str], when: str) -> None:
+        self._set_state(inc, "CORRELATING")
+        self._put(ctx, inc)
+        audit = inc["mode"] == "security_audit"
+        await activity(ctx, inc["incident_id"], AGENT_NAME, "Asked Detective to map the code" if audit else "Asked Detective to find the cause")
+        await self._say(ctx, inc, "")
+        await self._send(ctx, "detective", CommitCorrelationRequest(
+            incident_id=inc["incident_id"], repo_full_name=inc["repo"], branch=inc["branch"], failure_timestamp_utc=when,
+            failing_endpoint=endpoint, error_snippet=evidence or None))
+
+    async def _after_web_probe(self, ctx: Context, inc: Dict[str, Any], rep: HealthProbeReport) -> None:
+        """A healthy or unreachable service does not end a web incident: the user described a problem and gave a repo."""
+        failing = next((m for m in rep.metrics if not 200 <= m.status_code < 300), None)
+        stats = summarize(rep.metrics)
+        problem = inc.get("problem", "")
+        if failing is None or failing.status_code == 0:
+            inc["service_note"] = "healthy" if failing is None else "unreachable"
+            await self._correlate_web(ctx, inc, "", problem, _now_iso())
+            return
+        inc["probe"] = {"endpoint": failing.endpoint, "status": failing.status_code, "latency_ms": failing.latency_ms,
+                        "failure_ts": failing.timestamp_utc, "failing": int(stats["failing"]), "total": int(stats["total"]),
+                        "p95_ms": stats["p95_ms"]}
+        evidence = "\n".join(p for p in (failing.error_snippet, f"User report: {problem}" if problem else "") if p)
+        await self._correlate_web(ctx, inc, failing.endpoint, evidence, failing.timestamp_utc)
+
+    async def _finish_web_draft(self, ctx: Context, inc: Dict[str, Any], res: PatchDraftResult) -> None:
+        inc["result"] = res.dict()
+        if res.no_bug:
+            self._set_state(inc, "RESOLVED")
+            inc["delivery"] = "no_bug"
+            self._put(ctx, inc)
+            await activity(ctx, inc["incident_id"], AGENT_NAME, "Nothing to change, so I'm not proposing a fix", DONE)
+            await self._say(ctx, inc, "", end=True)
+            return
+        if not res.attestation.approved:
+            await self._fail(ctx, inc, "I could not write a fix that passed the security check, so I am not proposing one.",
+                             "Try adding more detail to the problem, such as the exact error message or file.")
+            return
+        inc["action_type"] = "OPEN_PR_AND_HOTFIX"
+        if inc["repo"].lower() in self.cfg.writable_repos:
+            self._set_state(inc, "AWAITING_APPROVAL")
+            inc["authorization"] = "operator click in the web console"
+            self._put(ctx, inc)
+            await activity(ctx, inc["incident_id"], AGENT_NAME, "Waiting for your approval in the chat")
+            await self._say(ctx, inc, "")
+            return
+        self._set_state(inc, "RESOLVED")      # nothing to authorize: Sentinel cannot write here, so it hands over the fix
+        inc["delivery"] = "files"
+        self._put(ctx, inc)
+        await activity(ctx, inc["incident_id"], AGENT_NAME, "The fix is ready to download", DONE)
+        await self._say(ctx, inc, "", end=True)
+
     async def _start_incident(self, ctx: Context, sender: str, intent: Intent) -> None:
         cfg, notes = self.cfg, []
         repo, url = intent.repo, intent.url
@@ -272,6 +362,9 @@ class Orchestrator:
             else:
                 inc = self._accept(ctx, sender, "watchdog", rep.incident_id, {"PROBING"})
             if inc is None:
+                return
+            if inc.get("source") == WEB:
+                await self._after_web_probe(ctx, inc, rep)
                 return
             if rep.is_healthy:
                 self._set_state(inc, "RESOLVED")
@@ -322,13 +415,24 @@ class Orchestrator:
             if inc is None:
                 return
             inc["evidence"] = ev.dict()
+            web = inc.get("source") == WEB
+            if web and ev.offending_file == "unknown" and inc["mode"] != "security_audit":
+                await self._fail(ctx, inc, "I could not tell which file this problem comes from.",
+                                 "Add the error message, or name the page or file that is failing.")
+                return
+            fix_title = sentinel_fix_title(ev.commit_message)
+            if fix_title and inc["mode"] != "security_audit":   # blaming our own fix would roll it back: see build_already_fixed
+                await self._fail(ctx, inc, card.build_already_fixed(ev, fix_title), card.ALREADY_FIXED_HINT)
+                return
             self._set_state(inc, "SCANNING")
             self._put(ctx, inc)
             await self._say(ctx, inc, f"🧬 Commit [`{card.short_sha(ev.suspect_commit_sha)}`]({ev.suspect_commit_url}) by @{ev.author} identified — "
                                       f"`{ev.offending_file}`.\n> {ev.root_cause_explanation}\n\n🛡️ Scanning dependencies and code…")
+            whole_repo = web and inc["mode"] == "security_audit"
             await self._send(ctx, "scanner", VulnerabilityScanRequest(
-                incident_id=ev.incident_id, repo_full_name=ev.repo_full_name, suspect_commit_sha=ev.suspect_commit_sha,
-                modified_files=[ev.offending_file], active_ast_imports=ev.active_ast_imports))
+                incident_id=ev.incident_id, repo_full_name=ev.repo_full_name, branch=inc.get("branch", "main"),
+                suspect_commit_sha=ev.suspect_commit_sha if ev.confidence == "high" else "",
+                modified_files=["*"] if whole_repo else [ev.offending_file], active_ast_imports=ev.active_ast_imports))
         except Exception as exc:
             await self._pipeline_error(ctx, ev.incident_id, "correlate", exc)
 
@@ -342,6 +446,8 @@ class Orchestrator:
             if inc["mode"] == "security_audit":
                 self._set_state(inc, "RESOLVED")
                 self._put(ctx, inc)
+                if inc.get("source") == WEB:
+                    await activity(ctx, rep.incident_id, AGENT_NAME, "The security check is finished", DONE)
                 await self._say(ctx, inc, card.build_audit_report(inc["incident_id"], inc["repo"], ev, rep), end=True)
                 return
             self._set_state(inc, "PATCHING")
@@ -350,7 +456,8 @@ class Orchestrator:
             await self._say(ctx, inc, f"📋 {len(rep.cve_findings)} CVE(s) ({reachable} reachable, {rep.total_reachable_critical} reachable CRITICAL) and "
                                       f"{len(rep.sast_findings)} code finding(s).\n\n🩹 Drafting a fix — every draft must pass the security gatekeeper first…")
             await self._send(ctx, "executor", PatchDraftRequest(
-                incident_id=rep.incident_id, repo_full_name=inc["repo"], commit_evidence=ev, vuln_report=rep))
+                incident_id=rep.incident_id, repo_full_name=inc["repo"], commit_evidence=ev, vuln_report=rep,
+                branch=inc.get("branch", "main"), problem=inc.get("problem", "")))
         except Exception as exc:
             await self._pipeline_error(ctx, rep.incident_id, "scan", exc)
 
@@ -358,6 +465,12 @@ class Orchestrator:
         try:
             inc = self._accept(ctx, sender, "executor", res.incident_id, {"PATCHING"})
             if inc is None:
+                return
+            if inc.get("source") == WEB:
+                await self._finish_web_draft(ctx, inc, res)
+                return
+            if res.no_bug:
+                await self._fail(ctx, inc, f"I read `{res.attestation.target_file}` and did not find this problem there. {res.explanation}")
                 return
             # Everything the card needs is computed BEFORE the first await (CLAUDE.md §9.2 timing rule),
             # so step 9 can fire RequestPayment immediately in _request_authorization.
@@ -373,6 +486,7 @@ class Orchestrator:
             text = card.build_incident_card(inc["incident_id"], inc["service_url"], inc["repo"], p, ev, vuln, res, blast,
                                             self.cfg.patch_max_attempts, payment_required=not self.skip_payment)
             inc["result"] = res.dict()
+            inc["blast"] = asdict(blast)
             inc["action_type"] = "OPEN_PR_AND_HOTFIX" if att.approved else "ROLLBACK_COMMIT"
             inc["card"] = text
             if not att.approved and not res.rollback_available:
@@ -543,9 +657,11 @@ class Orchestrator:
             cmd = ExecuteRemediationCommand(
                 incident_id=inc["incident_id"], repo_full_name=inc["repo"], action_type=inc["action_type"],
                 dorado_tx_hash=inc.get("dorado_tx_hash", ""), payer_wallet=inc.get("payer_wallet", ""), attestation=att,
-                service_reload_webhook=f"{url}/admin/apply-hotfix" if url else None)
+                service_reload_webhook=f"{url}/admin/apply-hotfix" if url else None, branch=inc.get("branch", "main"))
             self._set_state(inc, "EXECUTING")
             self._put(ctx, inc)
+            if inc.get("source") == WEB:
+                await self._say(ctx, inc, "")
             log(ctx.logger, inc["incident_id"], AGENT_NAME, "execute", f"🚀 sending {inc['action_type']} to Agent_5")
             await self._send(ctx, "executor", cmd)
         except Exception as exc:
@@ -561,12 +677,20 @@ class Orchestrator:
                 await self._fail(ctx, inc, f"The Agent_5 could not complete the change: {rep.summary_message[:300]}",
                                  RECOVERY["Agent_5"])
                 return
+            if inc.get("source") == WEB and not rep.redeploy_triggered:
+                self._set_state(inc, "RESOLVED")    # the service changes when the PR is merged and deployed, not now
+                inc["last_note"] = "pr-opened"
+                self._put(ctx, inc)
+                await activity(ctx, rep.incident_id, AGENT_NAME, "The pull request is ready for your review", DONE)
+                await self._say(ctx, inc, "", end=True)
+                return
             self._set_state(inc, "VERIFYING")
             self._put(ctx, inc)
             hook = "✅ hotfix triggered" if rep.redeploy_triggered else "⚠️ hotfix **not** triggered"
             await self._say(ctx, inc, f"🔀 Pull request opened: {rep.pr_url}\n\n📦 SBOM: {rep.sbom_file_url} · {hook}\n\n"
                                       "🐤 Running a canary probe against the live service…")
-            await self._send(ctx, "watchdog", HealthProbeRequest(incident_id=rep.incident_id, service_url=inc["service_url"], is_canary_check=True))
+            canary = HealthProbeRequest(incident_id=rep.incident_id, service_url=inc["service_url"], is_canary_check=True)
+            await self._send(ctx, "watchdog", canary.copy(update={"endpoints": inc["endpoints"]}) if inc.get("endpoints") else canary)
         except Exception as exc:
             await self._pipeline_error(ctx, rep.incident_id, "execute", exc)
 
@@ -579,6 +703,8 @@ class Orchestrator:
         self._put(ctx, inc)
         log(ctx.logger, inc["incident_id"], AGENT_NAME, "canary", "✅ canary healthy: incident RESOLVED" if rep.is_healthy
             else "⛔ canary still failing", level="info" if rep.is_healthy else "error")
+        if inc.get("source") == WEB:
+            await activity(ctx, inc["incident_id"], AGENT_NAME, "Service recovered" if rep.is_healthy else "Service is still failing", DONE)
         await self._say(ctx, inc, text, end=True)
 
     async def handle_agent_error(self, ctx: Context, sender: str, err: AgentErrorReport) -> None:
@@ -637,6 +763,10 @@ class Orchestrator:
         if last and last.get("service_url") and last.get("repo"):
             text += f"\n\nTo start again, send:\n`Diagnose and heal {last['service_url']} for repo {last['repo']}`"
         return text + "\n\nSay `status` to see your incidents."
+
+    def incidents_snapshot(self, ctx: Context, limit: int = 20) -> List[Dict[str, Any]]:
+        """Newest-first ids and states: the console's heartbeat. Records reach it through IncidentUpdate."""
+        return [{"incident_id": inc["incident_id"], "state": inc["state"]} for inc in reversed(self._all(ctx)[-limit:])]
 
     async def _decide(self, ctx: Context, user: str, intent: Intent) -> None:
         mine = self._mine(ctx, user)
@@ -765,6 +895,14 @@ def create_agent(
     @agent.on_message(AgentErrorReport)
     async def _on_error(ctx: Context, sender: str, msg: AgentErrorReport) -> None:
         await orch.handle_agent_error(ctx, sender, msg)
+
+    @agent.on_message(IncidentRequest)
+    async def _on_incident_request(ctx: Context, sender: str, msg: IncidentRequest) -> None:
+        await orch.handle_incident_request(ctx, sender, msg)
+
+    @agent.on_rest_get("/incidents", IncidentListResponse)
+    async def _incidents(ctx: Context) -> IncidentListResponse:
+        return IncidentListResponse(incidents=orch.incidents_snapshot(ctx))
 
     @agent.on_interval(period=10.0)
     async def _sweep(ctx: Context) -> None:

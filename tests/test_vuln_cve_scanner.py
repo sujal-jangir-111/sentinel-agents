@@ -13,6 +13,7 @@ from common.patching import bump_requirements, fix_unsafe_yaml, harden_secrets, 
 from common.osv_client import CRITICAL_EXPLOITABLE, LATENT_DEPENDENCY, classify
 from tests.bureau_harness import agent_test_kwargs, run_roundtrip
 from tests.fakes import (
+    draft_adding_a_new_finding,
     DEMO_FILES, HEAD_SHA, REPO, FakeWeb, fully_fixed_app_source, runtime_fixed_app_source, sql_fixed,
 )
 
@@ -234,14 +235,19 @@ async def test_gatekeeper_rejects_unfixed_reachable_cve(ctx):
     assert not any("urllib3" in r for r in att.rejection_reasons)  # latent CVEs are not required to be fixed
 
 
-async def test_gatekeeper_rejects_remaining_sast_findings_without_leaking_the_secret(ctx):
+async def test_gatekeeper_rejects_a_patch_that_adds_a_security_finding(ctx):
     scanner, _ = await scanned(ctx)
-    att = await vet(scanner, ctx, vet_request(patched=runtime_fixed_app_source()))
+    att = await vet(scanner, ctx, vet_request(patched=draft_adding_a_new_finding()))
     assert att.approved is False
     joined = " | ".join(att.rejection_reasons)
-    for rule in ("HARDCODED_SECRET", "UNSAFE_DESERIALIZATION", "SQL_INJECTION"):
-        assert rule in joined
-    assert "sk_test_51SENTINELDEMOxxxxxxxx" not in joined and "sk_tes****" in joined
+    assert "UNSAFE_EVAL" in joined and "sk_test_51SENTINELDEMOxxxxxxxx" not in joined
+
+
+async def test_findings_the_file_already_had_do_not_block_a_fix(ctx):
+    """In a real codebase one old warning would otherwise reject every patch, so a fix only has to not make things worse."""
+    scanner, _ = await scanned(ctx)
+    att = await vet(scanner, ctx, vet_request(patched=runtime_fixed_app_source()))
+    assert att.approved is True and att.rejection_reasons == []
 
 
 async def test_gatekeeper_rejects_patch_that_leaves_the_offending_line(ctx):

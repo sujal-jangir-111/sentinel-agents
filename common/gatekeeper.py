@@ -4,8 +4,10 @@ Each check returns a list of specific rejection reasons (empty = pass).
 """
 import ast
 import hashlib
+from collections import Counter
 from typing import Iterable, List, Optional, Sequence
 
+from common.code_checks import broken_references
 from common.models import CVEFinding
 from common.osv_client import Dependency, version_key
 from common.patching import make_unified_diff, touches_offending_change
@@ -31,12 +33,27 @@ def check_syntax(target_file: str, patched_code: str) -> List[str]:
     return []
 
 
-def check_sast(target_file: str, patched_code: str) -> List[str]:
-    """Every SAST rule must be clean on the patched file."""
-    return [
-        f"{f.rule_id} at line {f.line_number}: {f.code_snippet} -> {f.remediation_advice}"[:MAX_REASON]
-        for f in scan_text(target_file, patched_code)
-    ]
+def check_references(target_file: str, patched_code: str, original: Optional[str] = None) -> List[str]:
+    """Names and standard-library attributes that cannot exist. Only new ones count, as with security findings."""
+    if not target_file.endswith(".py"):
+        return []
+    known = broken_references(original) if original else set()
+    return [f"{name} does not exist, so this code would crash when it reaches that line"[:MAX_REASON]
+            for name in sorted(broken_references(patched_code) - known)]
+
+
+def check_sast(target_file: str, patched_code: str, original: Optional[str] = None) -> List[str]:
+    """A patch may not add a security finding. Findings the file already had do not block a fix: one old warning in a
+    real codebase would otherwise reject every patch. Without `original`, every finding counts."""
+    baseline = Counter((f.rule_id, f.code_snippet) for f in scan_text(target_file, original)) if original is not None else Counter()
+    reasons: List[str] = []
+    for f in scan_text(target_file, patched_code):
+        key = (f.rule_id, f.code_snippet)
+        if baseline[key] > 0:
+            baseline[key] -= 1
+        else:
+            reasons.append(f"{f.rule_id} at line {f.line_number}: {f.code_snippet} -> {f.remediation_advice}"[:MAX_REASON])
+    return reasons
 
 
 def check_diff(original: Optional[str], patched_code: str, target_file: str, claimed_diff: str, base_ref: str) -> List[str]:
@@ -64,20 +81,22 @@ def check_cves_fixed(
     new_deps: Iterable[Dependency],
     new_findings: Iterable[CVEFinding],
 ) -> List[str]:
-    """Every previously reachable CVE must be gone and its package pinned at or above the fixed version.
+    """Every previously reachable CVE with a published fix must be gone and its package pinned at or above that
+    version. A CVE with no fixed release cannot be solved by a patch, so it does not block one.
     Without a stored scan (previously_reachable is None-equivalent) use check_no_critical instead."""
     deps = {d.name: d for d in new_deps}
     still = {(f.package_name, f.vuln_id) for f in new_findings}
     reasons: List[str] = []
     for prev in previously_reachable:
         name, vuln_id, fixed = prev["package_name"], prev["vuln_id"], prev["fixed_version"]
+        if fixed == "unknown":
+            continue
         dep = deps.get(name)
         if dep is None:
             reasons.append(f"{name} ({vuln_id}) is not pinned in the updated requirements.txt")
         elif (name, vuln_id) in still:
-            reasons.append(f"{vuln_id} still affects {name}=={dep.version}"
-                           + (f" (fixed in {fixed})" if fixed != "unknown" else ""))
-        elif fixed != "unknown" and version_key(dep.version) < version_key(fixed):
+            reasons.append(f"{vuln_id} still affects {name}=={dep.version} (fixed in {fixed})")
+        elif version_key(dep.version) < version_key(fixed):
             reasons.append(f"{name}=={dep.version} is below the fixed version {fixed} ({vuln_id})")
     return reasons
 

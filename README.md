@@ -1,200 +1,334 @@
-# AddressMatch
+<div align="center">
 
-**AddressMatch** is a high-performance, local-first entity resolution and deduplication web application built specifically for Indian addresses. Given up to 10 million noisy, unstructured, free-text addresses `(ID + address)`, it groups records that refer to the exact same physical delivery point **without merging different flats, units, or buildings**.
+# 🛡️ Sentinel
 
-It operates completely locally without external address databases or paid maps APIs, utilizing multi-key candidate blocking, hierarchical sub-blocking, component-aware fuzzy scoring, and a consistency-checked Union-Find clustering engine.
+### Describe a bug and paste a GitHub link.<br>Five AI agents find the cause, write a fix, and try to reject it before you ever see it.
 
----
+<br>
 
-## Architecture Diagram
+![Python](https://img.shields.io/badge/Python-3.11-3776AB?style=flat-square&logo=python&logoColor=white)
+![uAgents](https://img.shields.io/badge/uAgents-multi--agent-5F43F1?style=flat-square)
+![Groq](https://img.shields.io/badge/LLM-Groq-F55036?style=flat-square)
+![FastAPI](https://img.shields.io/badge/FastAPI-WebSockets-009688?style=flat-square&logo=fastapi&logoColor=white)
+![React](https://img.shields.io/badge/React_19-TypeScript-61DAFB?style=flat-square&logo=react&logoColor=black)
+![Docker](https://img.shields.io/badge/Docker-226_MB-2496ED?style=flat-square&logo=docker&logoColor=white)
+![Tests](https://img.shields.io/badge/tests-588_passing-2EA44F?style=flat-square)
 
+<br>
 
-flowchart TD
-    Raw["Raw Free-Text Address (ID + Address)"] --> Norm["1. normalize.py\n(Hindi Transliteration, Abbreviation Expansion, Number Preservation)"]
-    Norm --> Ext["2. extract.py\n(Rule-based Regex: Flat, Building, Road, Locality, City, PIN)"]
-    Ext --> Block["3. blocking.py\n(Multi-Key: Tokens, Soundex/Metaphone, MinHash LSH)"]
-    Block --> SubBlock{"Block Size > 500?"}
-    SubBlock -->|Yes| HierSub["Hierarchical Sub-blocking\n(flat_no -> building -> road) & Audit Log"]
-    SubBlock -->|No| Candidates["Candidate Pair Generation"]
-    HierSub --> Candidates
-    Candidates --> Score["4. scoring.py\n(RapidFuzz Component Weights + Hard Conflict Rules)"]
-    Score --> Policy{"Uncertainty Policy Tier"}
-    Policy -->|Score >= 0.90 & No Conflict| MergeCand["Auto-Merge Candidates"]
-    Policy -->|0.70 <= Score < 0.90 OR Missing Critical| RevQueue["Review Queue (Human-in-the-Loop)"]
-    Policy -->|Score < 0.70 OR Hard Conflict| Separate["Separate (Never Merge)"]
-    MergeCand --> Group["5. grouping.py\n(Consistency-Checked Union-Find)"]
-    RevQueue -->|Human Decision: Approve/Reject| Group
-    Group --> Rep["6. representative.py\n(Most Complete Real Record Consensus)"]
-    Rep --> Output["Final Delivery Point Groups & Metrics"]
+<img src="docs/images/home.png" alt="Sentinel's home screen: a single box asking what's broken" width="820">
 
+</div>
 
----
+<br>
 
-## Tech Stack
+**Sentinel is a self-healing DevSecOps system.** There's nothing to learn and nothing to install on your repository. You open a chat, say what's wrong, and watch five agents work on it live. The cause and the fix come back in the conversation, and nothing changes on GitHub until you click Approve.
 
-- **Backend**:
-  - Python 3.11+ / 3.13
-  - **FastAPI**: Async REST APIs
-  - **RapidFuzz**: High-performance C-accelerated Levenshtein and token-set fuzzy matching
-  - **datasketch**: MinHash and Locality-Sensitive Hashing (LSH) on character 3-grams
-  - **indic-transliteration**: Devanagari to Roman transliteration with Hindi numeral preservation
-  - **pandas**: Tabular data manipulation and CSV handling
-  - **pytest**: Automated unit testing suite
-- **Frontend**:
-  - **React 18** with **Vite**
-  - **Tailwind CSS**: Modern responsive styling with Dark & Light mode
-  - **Recharts**: Interactive dual-axis and logarithmic charts for candidate reduction & histograms
-  - **Lucide React**: Clean iconography
+The agents, GitHub, the vulnerability database and the LLM are all real. Here's [a pull request Sentinel opened](https://github.com/sujal-jangir-111/sentinel-target/pull/5), with its root cause, findings, security attestation and SBOM.
 
----
+<br>
 
-## Pipeline Modules
+## Contents
 
-AddressMatch implements a clean, modular 7-stage pipeline:
+[What it's like to use](#what-its-like-to-use) · [How it works](#how-it-works) · [Tested against a hidden answer key](#tested-against-a-hidden-answer-key) · [Engineering decisions](#engineering-decisions) · [Tech stack](#tech-stack) · [Run it](#run-it) · [Deploy it](#deploy-it) · [Configuration](#configuration) · [Project structure](#project-structure) · [Scope and limits](#scope-and-limits) · [What's next](#whats-next) · [Background](#background)
 
-1. **`backend/normalize.py`**:
-   - Lowercases input text and removes punctuation while strictly preserving digits and alphanumeric tokens (e.g. `A-101`, `101/B`, `302017`).
-   - Converts Devanagari numerals (`०-९` $\to$ `0-9`).
-   - Replaces common Hindi address lexicon (`फ्लैट` $\to$ `flat`, `अपार्टमेंट` $\to$ `apartments`, `मार्ग` $\to$ `road`, `कमल` $\to$ `lotus`, etc.) and transliterates remaining Devanagari text.
-   - Expands abbreviations via a domain dictionary (`apt/apts` $\to$ `apartments`, `rd/marg` $\to$ `road`, `nr` $\to$ `near`, `opp` $\to$ `opposite`, `soc` $\to$ `society`, `flt` $\to$ `flat`, `bldg` $\to$ `building`, etc.).
-   - Collapses whitespace.
+<br>
 
-2. **`backend/extract.py`**:
-   - Rule/regex-based extraction of 6 core components: `flat_no`, `building`, `road`, `locality`, `city`, and `pin`.
-   - Each field returns `value` + `confidence` (0.0 to 1.0).
-   - Missing fields strictly return `None` (never guesses).
+## What it's like to use
 
-3. **`backend/blocking.py`**:
-   - Multi-key candidate generation to scale to millions of records without $O(N^2)$ quadratic explosion:
-     - **Key A**: Building + Locality (or City) tokens.
-     - **Key B**: Soundex / Metaphone of Road name + City.
-     - **Key C**: MinHash LSH on character 3-grams of normalized text (`threshold = 0.5`).
-   - **MAX_BLOCK_SIZE = 500**: Blocks exceeding 500 records are hierarchically sub-partitioned by:
-     1. `flat_no`
-     2. `building`
-     3. `road`
-   - Every oversized block event is formally logged for audit.
+**1. Tell it the problem.** Write it the way you'd tell a teammate, and paste your link. A traceback or a live URL helps, but neither is required.
 
-4. **`backend/scoring.py`**:
-   - Per-component similarity using RapidFuzz (`token_sort_ratio`, `token_set_ratio`).
-   - Component weights (Building 0.30, Road 0.20, Locality 0.15, City 0.15, Full text 0.20).
-   - **Hard Conflict Rules**:
-     - Two known, different flat numbers $\implies$ `HARD_CONFLICT` (Score forced to 0.0, never merge).
-     - Different known buildings $\implies$ Strong penalty (-0.40) or veto.
-     - PIN mismatch $\implies$ Soft penalty only (-0.05).
-     - Missing critical field (e.g. flat number) $\implies$ Flagged as `UNCERTAIN`.
+> *A 10% coupon on a $200 cart should give $180 but customers pay $190. https://github.com/you/your-repo*
 
-5. **`backend/grouping.py`**:
-   - **Consistency-Checked Union-Find**:
-     - Pre-sorts valid match pairs by descending score (best-first).
-     - Before merging two groups, verifies that **no pairwise combination** of members violates a hard conflict.
-     - **Transitive Conflict Prevention**: If a chain $A \sim B \sim C$ has conflicting $A$ and $C$ (e.g. $A$ has Flat 402, $C$ has Flat 403, and $B$ lacks a flat number), the engine blocks the merge, keeps $B$ with its stronger match, and isolates the conflicting edge to the human **Review Queue**.
+**2. Watch the agents.** The panel shows what each agent is really doing at that moment. Every line is an event the agent sent, not a progress bar someone guessed at.
 
-6. **`backend/policy.py`**:
-   - Three-tier uncertainty policy (thresholds dynamically configurable):
-     - **`AUTO_MERGE`**: `score >= 0.90` AND no conflicts AND not uncertain.
-     - **`REVIEW`**: `0.70 <= score < 0.90` OR missing critical field.
-     - **`SEPARATE`**: `score < 0.70` OR any hard conflict.
+<div align="center">
+<img src="docs/images/live-agents.png" alt="The chat beside a live panel: the Detective has found the file and the Security Inspector is reading the dependency list" width="820">
+</div>
 
-7. **`backend/representative.py`**:
-   - Canonical representative selection: scores every real record in the group by field completeness, group consensus, and text cleanliness.
-   - Selects an authentic, real record as the group representative (never hallucinates missing details).
-   - Compiles a consensus attribute dictionary from confirmed real values.
+**3. Decide.** The cause, the exact code change and every package upgrade appear in the chat, about 15 to 60 seconds later on a small repository.
 
----
+<div align="center">
+<img src="docs/images/fix-card.png" alt="A fix card showing the code change, a passed security check, a note that the code has not been run, and Approve and Reject buttons" width="820">
+</div>
 
-## Canonical Reference Test Case (Lotus Apartments)
+- **On a repository Sentinel may write to,** Approve opens a pull request on a new branch. Nothing is ever merged for you.
+- **On any other public repository,** you download the fixed files. GitHub only lets a repository's owner grant write access, so Sentinel doesn't pretend otherwise.
+- **If the code is actually fine,** it says so and changes nothing.
 
-The application ships with the exact required benchmark set:
+It can also run a **security check** on any public repository in about 10 seconds. Type *"Run a security check on (your link)"*.
 
-| Record ID | Raw Input Address | Expected Delivery Point Group | Result |
-| :--- | :--- | :--- | :--- |
-| **A101** | `Flat 402, Lotus Apartments, JLN Road, Jaipur 302017` | **Group 1** | Merged |
-| **A102** | `402, Lotus Apts, JLN Marg, Jaipur - 302017` | **Group 1** | Merged |
-| **A103** | `Flat 403, Lotus Apartments, JLN Road, Jaipur 302017` | **Group 2** (Different Flat!) | **Kept Separate** |
-| **A104** | `Apt #402, Lotus Appts, Near WTP, JLN Rd, Jaipur` | **Group 1** | Merged |
+<br>
 
-Verified by automated tests: **Group 1 = [A101, A102, A104]** and **Group 2 = [A103]**.
+## How it works
 
----
-
-## Design Justification for the Uncertainty Policy
-
-### 1. Why Three Tiers?
-In physical address resolution, errors have asymmetric real-world consequences:
-- **False Merge (Two different flats merged into one)**: Mail, legal notices, or high-value packages are delivered to the wrong resident or lost entirely. AddressMatch enforces zero-tolerance on false merges.
-- **Missed Merge (True duplicate not merged)**: Results in redundant marketing or two internal customer profile IDs, which is minor in comparison.
-- The 3-tier policy guarantees that high-confidence identical deliveries merge automatically (`AUTO_MERGE`), obvious non-matches are dropped (`SEPARATE`), and borderline or incomplete cases route to human verification (`REVIEW`).
-
-### 2. Why Soft Penalty on PIN Mismatch?
-In India, PIN codes are frequently:
-- Misremembered by users (e.g. typing `302018` instead of `302017` for adjacent sub-post offices).
-- Omitted entirely in rapid checkouts.
-- A hard veto on PIN codes would cause a massive missed-match rate on valid deliveries. A soft penalty (-0.05) penalizes postal discrepancy without blocking identity when flat, building, and road match.
-
-### 3. Why Strict Veto on Flat Numbers?
-A building like "Lotus Apartments" may contain 500 flats. The text similarity between `"Flat 402, Lotus Apartments..."` and `"Flat 403, Lotus Apartments..."` is **98.5%**. Standard fuzzy matching algorithms (like Levenshtein or Jaccard) would blindly merge them. AddressMatch treats flat identifiers as absolute hard constraints: different known flat numbers result in an immediate score of 0.0 and hard separation.
-
----
-
-## Scalability and Algorithmic Complexity
-
-| Record Count ($N$) | Naive $N^2/2$ Comparisons | AddressMatch Candidate Pairs $O(N \cdot B)$ | Candidate Reduction |
-| :--- | :--- | :--- | :--- |
-| **10,000** | 49,995,000 | ~220,000 | **99.56%** |
-| **100,000** | 4,999,950,000 | ~2,500,000 | **99.95%** |
-| **1,000,000** | 499,999,500,000 | ~28,000,000 | **99.994%** |
-| **10,000,000** | 49,999,995,000,000 | ~300,000,000 | **99.9994%** |
-
-### Expected vs. Worst-Case Cost
-- **Expected Cost**: $O(N \cdot \bar{B})$ time, where $\bar{B} \approx 20\text{–}45$. Records naturally partition across cities, PIN codes, and societies.
-- **Worst-Case Cost**: If 1,000,000 records share the exact same city or road, naive blocking would degrade to $O(N^2)$. AddressMatch's **Hierarchical Sub-blocking with MAX_BLOCK_SIZE = 500** dynamically partitions oversized blocks by `flat_no` $\to$ `building` $\to$ `road`, guaranteeing bounded block sizes and subquadratic scaling even in adversarial density distributions.
-
----
-
-## Setup & Running Locally
-
-### Prerequisites
-- Python 3.11+
-- Node.js 18+ (tested on v20.18.0)
-
-### 1. Install Backend Dependencies
-```bash
-pip install -r requirements.txt
-# or:
-pip install fastapi uvicorn rapidfuzz datasketch indic-transliteration pandas pytest scipy
+```mermaid
+flowchart LR
+    U(["You"]) <-->|WebSocket| C["Chat console<br/>React + FastAPI"]
+    C <--> L["Assistant<br/>LLM with tools"]
+    C <-->|signed messages| A1["Agent_1<br/>Manager"]
+    A1 <--> A2["Agent_2<br/>Health Checker"]
+    A1 <--> A3["Agent_3<br/>Detective"]
+    A1 <--> A4["Agent_4<br/>Security Inspector"]
+    A1 <--> A5["Agent_5<br/>Fixer"]
+    A5 <-->|every draft is vetted| A4
+    A2 -.-> S[("Live service")]
+    A3 -.-> G[("GitHub")]
+    A4 -.-> O[("OSV.dev and PyPI")]
+    A5 -.-> G
+    A2 & A3 & A4 & A5 -.->|live activity| C
 ```
 
-### 2. Run Automated Unit Tests
-```bash
-python -m pytest backend/tests/ -v
+Each agent is a separate process with its own cryptographic identity, built on [uAgents](https://github.com/fetchai/uAgents). They coordinate only through typed, signed messages, and every reply is checked against the address of the agent that should have sent it.
+
+| Agent | Role | What it does |
+|---|---|---|
+| **Agent_1** | Manager | Runs each case as a state machine and enforces the approval gate |
+| **Agent_2** | Health Checker | If you gave a URL, probes it and records errors and latency, and re-checks after a fix |
+| **Agent_3** | Detective | Goes to the failing line and the commit that changed it. With only a description, it reads the relevant code to find the file |
+| **Agent_4** | Security Inspector | Finds vulnerabilities and insecure code, then acts as an adversarial gatekeeper on every patch |
+| **Agent_5** | Fixer | Decides whether the problem is real, drafts the fix, reworks it on rejection, and opens the pull request |
+
+### One case, step by step
+
+```mermaid
+sequenceDiagram
+    actor You
+    participant Manager as Manager
+    participant Detective as Detective
+    participant Inspector as Security Inspector
+    participant Fixer as Fixer
+
+    You->>Manager: The problem and your GitHub link
+    Manager->>Detective: Find the cause
+    Detective-->>Manager: File, line, commit if one changed it
+    Manager->>Inspector: Scan the code and dependencies
+    Inspector-->>Manager: Vulnerabilities that really affect this code
+    Manager->>Fixer: Write a fix
+    alt The problem isn't there
+        Fixer-->>Manager: No bug: nothing is changed
+    else
+        loop Up to 3 attempts
+            Fixer->>Inspector: Draft
+            Inspector-->>Fixer: Rejected, with the exact reasons
+        end
+        Inspector-->>Fixer: Approved, with a signed-off hash
+        Fixer-->>Manager: Fix and attestation
+    end
+    Manager-->>You: Cause and fix in the chat
+    You->>Manager: Approve
+    Manager->>Fixer: Open the pull request
+    Fixer-->>You: Pull request link
 ```
 
-### 3. Run Application Server (Unified Mode)
-The production frontend build is already pre-compiled into `frontend/dist`. Running the FastAPI server serves both the backend API and the interactive React frontend:
+To be approved, a patch has to survive all of this. Agent_4 trusts nothing Agent_5 sends and recomputes the diff itself:
+
+- The file must parse, and the diff must match what's really on GitHub.
+- It may not add a security finding.
+- It may not use a name that doesn't exist, or a standard-library attribute that isn't real.
+- Every reachable vulnerability with a published fix must be gone.
+- The pinned packages must be able to install together.
+- If a commit changed the failing line, that change must be gone.
+
+<br>
+
+## Tested against a hidden answer key
+
+Unit tests prove the code does what I expected. They can't tell you whether an AI fixed a bug correctly, so I built a harder test.
+
+I planted **ten bugs** in [a real repository](https://github.com/sujal-jangir-111/sentinel-target), pushed them as normal-looking commits, and wrote behaviour tests the agents never see. A browser then used Sentinel as a new user, and every proposed fix was applied to a clean copy and **actually run**.
+
+The first run looked fine in the UI, with a green "safety check" badge on every fix, and only 6 of the 10 bugs were really fixed. Some fixes made things worse. That result drove most of the design below.
+
+| Test | First run | Now |
+|---|---|---|
+| **Planted bugs fixed** | 6 of 10, one only partly | **9 of 10** |
+| Crash, with a pasted traceback | ✅ | ✅ |
+| SQL injection | ✅ | ✅ |
+| Bug spanning two files | ✅ | ✅ |
+| Shared state between customers | ✅ | ✅ |
+| Wrong coupon maths | ❌ Wrong file | ✅ |
+| Pagination off by one | ❌ Made it worse | ✅ |
+| Path traversal | ⚠️ Fixed in the wrong layer | ✅ |
+| Two bugs in one file | ⚠️ One fixed | ✅ Both |
+| Unsafe `eval` | ❌ App wouldn't start | ❌ Safe, but rejected valid rules |
+| **False report on correct code** | ❌ Broke working code | ✅ Changed nothing |
+| **Live URL, old bug** | ⚠️ Deleted working routes | ✅ Fixed, routes kept |
+| **Vulnerable package** | ❌ Couldn't be installed | ✅ Only the pins changed |
+
+**One honest caveat:** results vary between runs. The `eval` fix passed in one Groq run and failed in the next, because the model wrote code that blocked the attack but also blocked `price * 0.9`. Sentinel doesn't run a stranger's code, so a mistake like that can't be seen from the text. That's why the card says **"Passed the security check"** and **"I haven't run this code"**, and never claims the fix works.
+
+<br>
+
+## Engineering decisions
+
+**The LLM never holds authority.** The model chats and drafts patches, but it can't approve anything, because approval isn't one of its tools. It can't choose a target either. During testing it invented a URL nobody had typed, so a repository or URL now only counts if the user actually wrote it.
+
+**A fix must survive a second agent.** Approval produces a SHA-256 attestation over the exact content. Agent_5 re-derives that hash before any GitHub write, so a patch changed after approval is refused.
+
+**"Nothing to fix" is a valid answer.** The first design rejected any patch that changed nothing and asked for another attempt. That pressured the model into "fixing" correct code, and it broke free shipping for orders of exactly $50. Now the Fixer can say there's no bug, and the case ends honestly.
+
+**A commit is only blamed for lines it changed.** Scoring commits by file made Sentinel blame an innocent commit for an old bug. A gatekeeper rule then demanded that commit's lines be removed, and the fix deleted working routes. With no commit on the failing line, no commit is blamed.
+
+**The chat model doesn't get to summarise your error.** It dropped the file and line from pasted tracebacks, so your own words now travel to the agents alongside its summary.
+
+**Deterministic first.** The failing line, commit blame, reachability and the gatekeeper are plain, unit-tested Python. The LLM is used only where judgement is needed, and each use has a fallback: if the model is down, the Detective uses the report's keywords, and the agents can still start from a message containing a GitHub link.
+
+**"No worse", not "perfect".** A patch may not add a security finding, but findings the file already had don't block it. Otherwise one old warning in a real project would reject every fix. What remains is reported to you.
+
+**Vulnerabilities are checked against real usage.** In the demo repository, 30 known vulnerabilities reduce to the 4 the code can actually reach. Where imports can't be traced, Sentinel says so and never implies "safe".
+
+**Upgrades have to install.** OSV says which version fixes a vulnerability, not what that version needs. A real run paired `requests` 2.33.0 with `urllib3` 1.24.1, which pip refuses, so Sentinel now reads each release's requirements from PyPI and moves companion packages too.
+
+**Safe by default.** Sentinel writes only to allowlisted repositories, never pushes to the default branch and never merges. Secrets are masked before anything reaches the LLM, a log or the UI. Repository content is treated as data, never as instructions.
+
+**Safe to expose.** On a public host the console requires a password, refuses to start without one, and rejects cross-site requests. User-supplied URLs are resolved first, so they can't reach the host's own ports, a private network or a cloud metadata service. Each browser is its own session, so updates, files and approvals only reach their owner.
+
+**Built to fail visibly.** Every stage has a timeout and a plain-English failure message. Short rate limits are waited out, and a supervisor restarts any crashed process in about 2 seconds.
+
+<br>
+
+## Tech stack
+
+| Layer | Technology |
+|---|---|
+| **Agents** | Python 3.11, [uAgents](https://github.com/fetchai/uAgents), asyncio, httpx |
+| **LLM** | Groq `openai/gpt-oss-20b` with function calling, behind a provider-neutral client that also supports Gemini |
+| **Backend** | FastAPI, WebSockets |
+| **Frontend** | React 19, TypeScript, Vite, Tailwind CSS. Light and dark, phone to desktop |
+| **Security data** | OSV.dev, PyPI metadata, custom SAST rules, Python `ast` import mapping, CycloneDX 1.5 SBOM |
+| **Integrations** | GitHub REST API |
+| **Delivery** | Docker (multi-stage, non-root, 226 MB), process supervisor, healthcheck |
+| **Testing** | pytest, pytest-asyncio, respx: 588 tests, plus real-browser journeys and the answer key above |
+
+<br>
+
+## Run it
+
+You need a free [Groq API key](https://console.groq.com/keys) and a GitHub token. Any token can read public repositories. To open pull requests, it needs **Contents** and **Pull requests** read/write on the repositories you allow.
+
 ```bash
-python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
+cp .env.example .env     # add your keys, five long random seeds and a password
 ```
-Open your browser at: **`http://localhost:8000`**
 
-### 4. Optional: Run Frontend in Development Mode (Vite)
-If you want hot-reloading for frontend modifications:
+### With Docker (recommended)
+
 ```bash
-cd frontend
-npm run dev
+docker compose up --build
 ```
-Open your browser at: **`http://localhost:5173`** (API requests are automatically proxied to port 8000).
 
----
+Open <http://127.0.0.1:8080> and sign in with your `CONSOLE_PASSWORD`.
 
-## Known Limitations & Future Work
+### Without Docker
 
-1. **Rural & Village Addresses**:
-   - Rural Indian addresses frequently lack house numbers and rely entirely on landmarks (e.g. *"Near Neem Tree, Post Office Gali, Village Rampura"*). These are flagged as `UNCERTAIN` by design and routed to the Review Queue.
-2. **Southern Dravidian Script Code-Switching**:
-   - The current transliteration engine natively supports Hindi (Devanagari) to Roman mapping. Extending phonetics to Kannada, Tamil, Telugu, and Malayalam will further improve non-Hindi regional accuracy.
-3. **Compound Unit Numbers**:
-   - Unusual formats like *"Old No. 12, New No. 45/A"* are extracted, but full historical mapping between renumbered municipalities requires historical cadastral cross-reference tables.
-#   d e l i v e r y h e l p e r 
- 
- 
+```bash
+python -m venv venv
+pip install -r requirements.txt       # inside the venv
+cd frontend && npm install && npm run build && cd ..
+python -m scripts.run_stack
+```
+
+On Windows, `.\scripts\start_demo.ps1 -Web` does the same in one window and waits until every agent is online. `-Stop` closes it.
+
+### Try it without a broken repository of your own
+
+A deliberately broken app is included. Build its repository once, set `DEMO_REPO_FULL_NAME` to it, and ask Sentinel about it:
+
+```bash
+python -m scripts.seed_demo_repo --create
+```
+
+> *My checkout crashes. https://github.com/you/sentinel-target, service at http://127.0.0.1:9000/api/checkout*
+
+Leave Sentinel's pull requests unmerged while you repeat the demo. If you merge one, `main` has nothing left to find, and `python -m scripts.seed_demo_repo --reset` rebuilds the broken history.
+
+### Tests
+
+```bash
+pytest -q                     # external services mocked
+pytest -m integration -q      # opt-in live calls
+cd frontend && npm run typecheck
+```
+
+<br>
+
+## Deploy it
+
+The whole system is **one container with one public port**. The agents talk over `127.0.0.1` inside it, so publish only the console.
+
+1. Push this repository and point any Docker host at the `Dockerfile`. The image uses the `PORT` the host assigns, or 8080.
+2. Set the [required variables](#configuration) as secrets on the host. `.env` is deliberately left out of the image.
+3. Give it about **1 GB of memory**. The stack idles at around 430 MB, so a 512 MB plan is too small.
+4. Attach a volume at `/data` to keep case records across deployments.
+5. Use the host's HTTPS, then check `/api/health`. It should report `"agents_online": true` within about a minute.
+
+The server refuses to listen publicly without `CONSOLE_PASSWORD`. This is deliberate.
+
+<br>
+
+## Configuration
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `GROQ_API_KEY` | ✅ | LLM access |
+| `GITHUB_TOKEN` | ✅ | Reads public repositories, and writes to allowed ones |
+| `DEMO_REPO_FULL_NAME` | ✅ | The repository Sentinel may open pull requests on |
+| `DEMO_ADMIN_TOKEN` | ✅ | Protects the demo app's hotfix and chaos endpoints |
+| `ORCHESTRATOR_SEED`, `WATCHDOG_SEED`, `DETECTIVE_SEED`, `SCANNER_SEED`, `EXECUTOR_SEED` | ✅ | Each agent's identity |
+| `CONSOLE_PASSWORD` | ✅ on a public host | The password for the whole console |
+| `LLM_PROVIDER` | | `groq`, `gemini` or `asi1` |
+| `GROQ_MODEL` | | Default `openai/gpt-oss-20b` |
+| `GROQ_ASSISTANT_MODEL`, `GROQ_FALLBACK_MODEL` | | A different chat model, and one to try if the main model is unavailable |
+| `GITHUB_WRITE_ALLOWLIST` | | More repositories Sentinel may write to, comma-separated |
+
+[.env.example](.env.example) has the full list.
+
+<br>
+
+## Project structure
+
+```
+├── agents/            The five agents, one process each
+├── common/            Shared logic: GitHub, OSV, gatekeeper, code search, LLM client
+├── web/               The console's backend: chat, sessions, sign-in, agent gateway
+├── frontend/          The React chat interface
+├── scripts/           Process supervisor, Windows start script, demo repository builder
+├── demo_target_app/   A deliberately broken service to try Sentinel on
+├── tests/             588 tests, including regressions for every bug found in live runs
+├── docs/images/       The screenshots above
+├── Dockerfile         One image with everything in it
+└── docker-compose.yml
+```
+
+<br>
+
+## Scope and limits
+
+Sentinel is a working prototype, and these are its real edges:
+
+- **Fixes aren't run.** A fix that passes the security check can still be wrong, so test it before merging. In the answer-key test, one of ten was.
+- **One problem at a time.** Each case fixes one reported problem, usually in one file. "Fix all my bugs" won't work, and it often won't find a second bug you didn't mention.
+- **Reports matter.** A traceback or live error gives a precise location. A plain description gives a best match, and the card says so.
+- **Pull requests need write access.** Repositories outside the allowlist get downloadable files.
+- **Public repositories only,** unless the token can read a private one and it's allowlisted.
+- **Python gets the deepest analysis.** Import mapping, code scanning and hardening are Python-only. Other languages get file location, LLM patching and vulnerability lookup for `package.json`, and Sentinel states how much it actually checked.
+- **One shared password and one LLM plan.** There are no user accounts. Groq's free plan allows about one case a minute in total, and very large files may not fit its limit.
+- **The automatic hotfix is demo-only.** A real service recovers when its own CI/CD deploys the merged pull request.
+- **Chats live in memory,** so a restart clears them. Case records survive with a volume.
+
+<br>
+
+## What's next
+
+- **A GitHub App,** so anyone can install Sentinel on their own repository and get real pull requests.
+- **Running fixes in a sandbox,** to catch the mistakes reading code can't.
+- **User accounts and per-user limits,** to open it beyond a shared password.
+- **Fixes across several files,** and a real "fix everything" mode.
+
+<br>
+
+## Background
+
+Sentinel began as a project for Fetch-A-Thon 3.0, where it ran through ASI:One and Agentverse with a testnet payment as change control. That path is still in the code, switched off: the ASI:One flow ran live end to end without payment, and the payment step is covered by unit tests but has never run on a live chain.
+
+I rebuilt it as a standalone product with its own chat interface, then tested it the hard way and fixed what that test found.

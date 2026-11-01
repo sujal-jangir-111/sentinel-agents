@@ -14,6 +14,8 @@ import httpx
 from uagents import Context
 
 from common import gatekeeper, osv_client
+from common.dependency_check import new_conflicts
+from common.activity import DONE, report as activity
 from common.agent_factory import build_agent
 from common.config import get_settings  
 from common.github_client import GitHubClient
@@ -35,6 +37,7 @@ DESCRIPTION = (
     "Agent_4 (Vuln-CVE-Scanner): reachability-aware CVE scan (OSV.dev), SAST, CycloneDX SBOM, and the patch gatekeeper that vets every fix. Part of the Sentinel self-healing DevSecOps swarm (Fetch-A-Thon 3.0)."
 )
 DEFAULT_BRANCH = "main"
+WHOLE_REPO = "*"
 
 
 def sast_candidates(modified_files: List[str]) -> List[str]:
@@ -78,13 +81,18 @@ class VulnScanner:
         assert self.gh is not None and self.http is not None, "clients not initialised"
         inc, repo, ref = msg.incident_id, msg.repo_full_name, msg.branch
 
+        await activity(ctx, inc, AGENT_NAME, "Reading the project's dependency list")
         manifests = await self.gh.fetch_manifests(repo, ref)
         deps = osv_client.parse_manifests(manifests)
-        paths = sast_candidates(msg.modified_files)
+        modified = msg.modified_files
+        if WHOLE_REPO in modified:    # a security audit looks at the code, not only one suspect file
+            modified = list(await self.gh.fetch_python_sources(repo, ref))
+        paths = sast_candidates(modified)
         log(ctx.logger, inc, AGENT_NAME, "scan",
             f"🛡️ Scanning {len(deps)} pinned dependencies and {len(paths)} file(s) at {repo}@{ref}")
 
-        cve_findings, sast_findings = await asyncio.gather(
+        await activity(ctx, inc, AGENT_NAME, f"Checking {len(deps)} dependencies and {len(paths)} file(s) for known problems")
+        cve_findings, (sast_findings, files_scanned) = await asyncio.gather(
             self._scan_dependencies(deps, msg.active_ast_imports), self._scan_code(repo, ref, paths),
         )
         reachable_critical = osv_client.count_reachable(cve_findings, "CRITICAL")
@@ -104,9 +112,12 @@ class VulnScanner:
         log(ctx.logger, inc, AGENT_NAME, "report",
             f"📋 {len(cve_findings)} CVEs ({reachable_critical} reachable CRITICAL), "
             f"{len(sast_findings)} SAST findings, SBOM with {len(sbom['components'])} components")
+        reachable = sum(1 for f in cve_findings if f.is_reachable_in_ast)
+        await activity(ctx, inc, AGENT_NAME, f"Checked {files_scanned} files and {len(deps)} dependencies: {reachable} vulnerabilities "
+                                             f"affect this code, {len(sast_findings)} code problems", DONE)
         return VulnerabilityReport(
             incident_id=inc, repo_full_name=repo, cve_findings=cve_findings, sast_findings=sast_findings,
-            total_reachable_critical=reachable_critical,
+            total_reachable_critical=reachable_critical, files_scanned=files_scanned, dependencies_scanned=len(deps),
         )
 
     async def _scan_dependencies(self, deps: List[osv_client.Dependency], imports: List[str]) -> list:
@@ -116,10 +127,12 @@ class VulnScanner:
         except OSVError as exc:
             raise OSVError(f"dependency scan failed: {exc}") from exc
 
-    async def _scan_code(self, repo: str, ref: str, paths: List[str]) -> List[SASTFinding]:
+    async def _scan_code(self, repo: str, ref: str, paths: List[str]) -> "tuple[List[SASTFinding], int]":
+        """(findings, how many files really existed and were scanned)."""
         assert self.gh is not None
         files = await asyncio.gather(*(self.gh.get_file(repo, p, ref) for p in paths))
-        return scan_files({f.path: f.text for f in files if f is not None})
+        found = {f.path: f.text for f in files if f is not None}
+        return scan_files(found), len(found)
 
 
     # -- Part B: adversarial patch gatekeeper ------------------------------------------------
@@ -144,22 +157,29 @@ class VulnScanner:
         scan_ctx: Optional[dict] = json.loads(raw_context) if raw_context else None
         branch = (scan_ctx or {}).get("branch", DEFAULT_BRANCH)
         log(ctx.logger, inc, AGENT_NAME, "gatekeeper", f"🔒 Vetting patch for {target} against {repo}@{branch}")
+        await activity(ctx, inc, AGENT_NAME, "Reviewing the draft: does it parse, is it safe, can it install?")
 
         original = await self.gh.get_file(repo, target, branch)
         reasons: List[str] = []
         reasons += gatekeeper.check_diff(original.text if original else None, msg.patched_code_content,
                                          target, msg.unified_diff, branch)
         reasons += gatekeeper.check_syntax(target, msg.patched_code_content)
-        reasons += gatekeeper.check_sast(target, msg.patched_code_content)
+        reasons += gatekeeper.check_references(target, msg.patched_code_content, original.text if original else None)
+        reasons += gatekeeper.check_sast(target, msg.patched_code_content, original.text if original else None)
         if scan_ctx and scan_ctx.get("suspect_commit_sha"):
             commit = await self.gh.get_commit(repo, scan_ctx["suspect_commit_sha"])
             offending = [ln for f in commit.files if f.filename == target for ln in added_lines(f.patch)]
             reasons += gatekeeper.check_fault_fixed(msg.patched_code_content, offending)
 
+        before = await self.gh.get_file(repo, "requirements.txt", branch)
+        reasons += [c.reason for c in await new_conflicts(self.http, before.text if before else "", msg.updated_requirements_txt)]
         new_deps = osv_client.parse_requirements(msg.updated_requirements_txt)
         new_findings = await osv_client.build_cve_findings(self.http, new_deps, [], self.vuln_cache)
         if scan_ctx is not None:
-            reasons += gatekeeper.check_cves_fixed(scan_ctx.get("reachable", []), new_deps, new_findings)
+            current = await self.gh.get_file(repo, "requirements.txt", branch)
+            managed = {d.name for d in osv_client.parse_requirements(current.text)} if current else set()
+            required = [r for r in scan_ctx.get("reachable", []) if r["package_name"] in managed]   # a patch can only bump these
+            reasons += gatekeeper.check_cves_fixed(required, new_deps, new_findings)
         else:
             reasons += gatekeeper.check_no_critical(new_findings)  # no stored scan: be conservative
 
@@ -168,7 +188,9 @@ class VulnScanner:
             inc, target, msg.unified_diff, msg.updated_requirements_txt, ctx.agent.address) if approved else ""
         if approved:
             log(ctx.logger, inc, AGENT_NAME, "gatekeeper", f"✅ Patch APPROVED (attestation {digest[:12]}…)")
+            await activity(ctx, inc, AGENT_NAME, "Draft passed the security review", DONE)
         else:
+            await activity(ctx, inc, AGENT_NAME, f"Sent the draft back: {reasons[0][:140]}")
             log(ctx.logger, inc, AGENT_NAME, "gatekeeper", f"❌ Patch REJECTED: {len(reasons)} reason(s)", level="warning")
             for reason in reasons:
                 log(ctx.logger, inc, AGENT_NAME, "gatekeeper", f"   - {reason}", level="warning")

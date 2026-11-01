@@ -4,10 +4,19 @@ from typing import Any, Dict
 
 from uagents import Agent
 from uagents.resolver import RulesBasedResolver
+from uagents_core.registration import AgentRegistrationPolicy
 
-from common.addresses import all_addresses
+from common.addresses import all_addresses, gateway_address
 
 LOCAL_PORTS = {"orchestrator": 8001, "watchdog": 8002, "detective": 8003, "scanner": 8004, "executor": 8005}
+GATEWAY_PORT = 8006   # the web backend's gateway agent (web/gateway.py)
+
+
+class NoRegistration(AgentRegistrationPolicy):
+    """Local mode never contacts Almanac / Agentverse: agents find each other through local_rules()."""
+
+    async def register(self, *args: Any, **kwargs: Any) -> None:
+        return None
 
 
 def local_mode() -> bool:
@@ -17,7 +26,11 @@ def local_mode() -> bool:
 
 def local_rules() -> Dict[str, str]:
     """agent address -> http://127.0.0.1:<port>/submit for every agent whose seed/address is configured."""
-    return {addr: f"http://127.0.0.1:{LOCAL_PORTS[key]}/submit" for key, addr in all_addresses().items() if addr}
+    rules = {addr: f"http://127.0.0.1:{LOCAL_PORTS[key]}/submit" for key, addr in all_addresses().items() if addr}
+    gateway = gateway_address()
+    if gateway:
+        rules[gateway] = f"http://127.0.0.1:{GATEWAY_PORT}/submit"
+    return rules
 
 
 def build_agent(
@@ -33,17 +46,14 @@ def build_agent(
     connected once via the Inspector link (Connect -> Mailbox). Never pass `endpoint=` here: it overrides the mailbox."""
     if not seed:
         raise RuntimeError(f"{seed_env} is not set; copy .env.example to .env and fill in the seeds")
-    readme = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "agents", "readmes",
-                          name.replace("-", "_") + ".md")
-    if "readme_path" not in agent_kwargs and os.path.isfile(readme):
-        agent_kwargs["readme_path"] = readme      # shown on the Agentverse profile, with the Innovation Lab badges
     if local_mode() and "endpoint" not in agent_kwargs and "resolve" not in agent_kwargs:
         # AGENT_MAILBOX=false: no Agentverse at all. Agents POST to each other's local /submit endpoint,
         # resolved from the fixed port table instead of the Almanac.
         mailbox = False
         agent_kwargs["endpoint"] = [f"http://127.0.0.1:{port}/submit"]
         agent_kwargs["resolve"] = RulesBasedResolver(local_rules())
-    return Agent(
-        name=name, seed=seed, port=port, mailbox=mailbox, publish_agent_details=True,
-        description=description, **agent_kwargs,
-    )
+        agent_kwargs.setdefault("registration_policy", NoRegistration())
+        agent_kwargs.update(publish_agent_details=False, mark_inactive_on_shutdown=False, report_events=False,
+                            enable_agent_inspector=False)
+    agent_kwargs.setdefault("publish_agent_details", True)
+    return Agent(name=name, seed=seed, port=port, mailbox=mailbox, description=description, **agent_kwargs)

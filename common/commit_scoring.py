@@ -25,6 +25,7 @@ MIN_SIGNAL = 15  # below this the ranking is noise and the LLM may break the tie
 
 _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@.*$", re.MULTILINE)
 _TRACEBACK_RE = re.compile(r'File "([^"]+)", line (\d+)')
+_SENTINEL_FIX_RE = re.compile(r"^Sentinel inc-[0-9a-f]{8}: fix .+$", re.MULTILINE)
 
 
 @dataclass
@@ -33,6 +34,13 @@ class ScoredCommit:
     score: int
     offending_file: Optional[str]
     reasons: List[str] = field(default_factory=list)
+
+
+def sentinel_fix_title(message: str) -> Optional[str]:
+    """The PR title if this commit merged a Sentinel forward fix (merge-commit body or squash title), else None.
+    Rollbacks are titled "roll back ..." and don't match: a merged rollback may well be the real cause of a failure."""
+    match = _SENTINEL_FIX_RE.search(message or "")
+    return match.group(0) if match else None
 
 
 def extract_error_location(snippet: Optional[str]) -> Tuple[Optional[str], Optional[int]]:
@@ -45,6 +53,40 @@ def extract_error_location(snippet: Optional[str]) -> Tuple[Optional[str], Optio
         path, lineno = frames[-1]
         return path.replace("\\", "/").rsplit("/", 1)[-1], int(lineno)
     return None, None
+
+
+def _matching_path(path: str, paths: Sequence[str]) -> Optional[str]:
+    """The repository file a traceback path means: most trailing folders in common, then the shortest path."""
+    wanted = path.replace("\\", "/").strip("/").split("/")
+
+    def shared(candidate: str) -> int:
+        count = 0
+        for ours, theirs in zip(reversed(candidate.split("/")), reversed(wanted)):
+            if ours != theirs:
+                break
+            count += 1
+        return count
+
+    best = max(paths, key=lambda p: (shared(p), -len(p)), default=None)
+    return best if best is not None and shared(best) else None
+
+
+def locate_in_repo(snippet: Optional[str], paths: Sequence[str]) -> Tuple[Optional[str], Optional[int]]:
+    """(repository path, line) of the innermost error location that is really this repository's code: a traceback often
+    ends inside a library. `paths` lists the repository's files."""
+    file, line = parse_error_snippet(snippet)
+    frames = [(file, line)] if file else []
+    frames += [(path, int(number)) for path, number in reversed(_TRACEBACK_RE.findall(snippet or ""))]
+    for path, number in frames:
+        found = _matching_path(path, paths)
+        if found:
+            return found, number
+    return None, None
+
+
+def changed_error_line(commit: CommitInfo, path: str, line: int) -> bool:
+    """Touching the same file proves nothing: a bug older than the recent commits still sits in a file they changed."""
+    return any(f.filename == path and hunk_covering(f.patch, line) for f in commit.files)
 
 
 def parse_hunks(patch: str) -> List[Tuple[int, int, str]]:

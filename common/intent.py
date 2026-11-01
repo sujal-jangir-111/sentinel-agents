@@ -11,6 +11,7 @@ MODES = ("diagnose_and_heal", "security_audit", "chaos_test", "status")
 
 _URL_RE = re.compile(r"https?://[^\s<>\"')\]]+", re.IGNORECASE)
 _REPO_RE = re.compile(r"(?<![\w./:@-])([A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*)(?![\w/])")
+_GITHUB_RE = re.compile(r"github\.com[/:]([A-Za-z0-9][\w.-]*)/([A-Za-z0-9][\w.-]*)", re.IGNORECASE)
 _INCIDENT_RE = re.compile(r"\b(inc-[0-9a-f]{8}|auto-[0-9a-f]{8})\b", re.IGNORECASE)
 _NOT_REPOS = {"and/or", "w/o", "n/a", "i/o", "tcp/ip", "yes/no", "y/n", "either/or", "http/https"}
 
@@ -52,6 +53,21 @@ def extract_repo(text: str) -> Optional[str]:
         if candidate.lower() not in _NOT_REPOS:
             return candidate
     return None
+
+
+def extract_service_url(text: str) -> Optional[str]:
+    """The first URL that is not GitHub itself: a repository link is not the service to test."""
+    urls = (u.rstrip(".,;:!?") for u in _URL_RE.findall(text))
+    return next((u for u in urls if "github.com" not in u.lower()), None)
+
+
+def extract_github_repo(text: str) -> Optional[str]:
+    """owner/repo from a GitHub link (https, ssh, or with a deeper path), else from a bare owner/repo."""
+    link = _GITHUB_RE.search(text)
+    if link:
+        name = link.group(2).rstrip(".")
+        return f"{link.group(1)}/{name[:-4] if name.lower().endswith('.git') else name}"
+    return extract_repo(text)
 
 
 def parse_action(text: str) -> Optional[str]:

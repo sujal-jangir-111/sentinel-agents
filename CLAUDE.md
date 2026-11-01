@@ -1,23 +1,32 @@
 # CLAUDE.md — Sentinel: Autonomous DevSecOps & Self-Healing Multi-Agent System
 
 > Project context for Claude Code. Read this file fully before writing or changing any code.
-> Hackathon: **Fetch-A-Thon 3.0** (Fetch.ai Innovation Lab). Every agent must be discoverable on **ASI:One** and registered on **Agentverse**.
+>
+> **Status:** Sentinel began at the Fetch-A-Thon 3.0 hackathon and is now the owner's standalone resume project. Its front end is the web console (`web/` + `frontend/`), its LLM is Groq's `openai/gpt-oss-20b`, and agents run in local mode with no Agentverse. Payment is off (`SKIP_PAYMENT=true`, code kept dormant) and an operator's click is the change control, which replaces the Dorado requirement in §15. The hackathon rules (§9.5, §13) no longer apply. **Where a section below disagrees with this note or with §4's notes, those win:** the sections from §5 on keep the original design for reference. The ASI:One/mailbox path still runs (`AGENT_MAILBOX=true`), without the Agentverse profile pages and address script, which were removed.
+>
+> **Product (the owner's direction):** a new user opens the chat, describes a problem and pastes *their* GitHub link. Nothing about the operator's repo may appear in the UI or be used as a default. Approvals and results belong in the chat, each agent's work is shown live, and the UI stays simple.
+>
+> **Where things stand:**
+> - **Deployment:** next step, as a password-protected demo. The image is tested locally (`docker run` with a real Groq fix); no real host, HTTPS, `docker compose` or multi-user run has been tested yet. The host isn't chosen (Render recommended). Nothing is committed since `f656785` and there is no git remote; the public `agents_demo` repo still holds the old code.
+> - **Live test:** ten bugs were planted in `sujal-jangir-111/sentinel-target`, marked by a hidden answer key that runs each proposed fix. On Groq, 9 of 10 were fixed; the `eval` fix was safe but rejected valid rules in one of two runs, so results vary by run. A false report changed nothing. The answer key and harness live only in the session scratchpad, not the repo.
+> - **`sentinel-target`:** `main` still holds the planted bugs (head `0bc8478e`, original `f45d7ea0`). PRs #1, #4 and #5 are open and must not be merged while it's the demo repo.
+> - **Secrets:** the GitHub token expires 2026-11-23. `GROQ_API_KEY` is in `.env`. The Gemini key was found in `.env.example` (removed, never committed) and should be rotated.
+> - **Deferred on purpose:** a GitHub App, so PRs work on any user's repo; running fixes in a sandbox; per-user accounts and limits; fixes spanning several files.
 
 ---
 
-## 1. What We Are Building (One Paragraph)  
+## 1. What We Are Building (One Paragraph)
 
-Sentinel is a closed-loop, 5-agent system built with the Python **uAgents** framework. A user types a request into **ASI:One** chat (e.g. *"Diagnose and heal the outage on https://sentinel-target.onrender.com for repo org/sentinel-target"*). The swarm then:
+Sentinel is a 5-agent self-healing DevSecOps system built with the Python **uAgents** framework. A user types a problem and their GitHub link into a web chat. Then the agents:
 
-1. probes the live service and captures the failure (HTTP 500, latency, traceback),
-2. correlates the failure with the exact offending Git commit and builds an AST map of imported packages/functions,
-3. runs reachability-aware CVE scanning (OSV.dev) and SAST,
-4. drafts a fix that a second agent must security-vet before it is allowed through,
-5. shows the user an ASI:One card and asks for a **0.1 FET Dorado testnet payment** as change-control authorization,
-6. after payment is verified on-chain, opens a real GitHub PR (with `tx_hash`, attestation and a CycloneDX SBOM), triggers a hotfix/redeploy,
-7. re-probes the service and reports the recovery (`HTTP 500 → HTTP 200 OK`) back in ASI:One.
+1. optionally probe a live service and capture the failure,
+2. find the failing line and the commit that changed it, or, from a description alone, read the code to find the right file, and map imported packages,
+3. run reachability-aware CVE scanning (OSV.dev) and SAST,
+4. decide whether the problem is real, and draft a fix that a second agent must vet before it is allowed through,
+5. show the cause and fix in the chat with Approve and Reject,
+6. after the click, open a real GitHub PR with an attestation and a CycloneDX SBOM, or hand over fixed files for repositories Sentinel can't write to.
 
-**Nothing in the demo path may be mocked.** OSV.dev, GitHub, ASI:One LLM and Dorado verification are real API calls. The only "staged" part is the deliberately broken demo target app.
+**Nothing in the product path may be mocked.** OSV.dev, GitHub and the LLM are real API calls. The original design had an ASI:One chat and a Dorado testnet payment; the "staged" part is still the deliberately broken demo target app.
 
 ---
 
@@ -27,8 +36,10 @@ Sentinel is a closed-loop, 5-agent system built with the Python **uAgents** fram
 |---|---|
 | Language | Python 3.11+ |
 | Agent framework | `uagents`, `uagents-core` (chat + payment protocols) |
+| Web console | FastAPI + WebSockets; React 19, TypeScript, Vite, Tailwind CSS |
+| Delivery | Docker: one container, process supervisor (`scripts/run_stack.py`) |
 | HTTP client | `httpx` (async only — never `requests` inside agent handlers) |
-| LLM | ASI:One, OpenAI-compatible: `https://api.asi1.ai/v1/chat/completions`, model `asi1-mini` |
+| LLM | Groq `openai/gpt-oss-20b` through the OpenAI-compatible endpoint (`common/llm_client.py`); Gemini and ASI:One are selectable with `LLM_PROVIDER` |
 | Chain | Fetch.ai **Dorado testnet** via `cosmpy` (`chain_id="dorado-1"`, denom `atestfet`) |
 | Vulnerability DB | OSV.dev `POST https://api.osv.dev/v1/querybatch` (no API key) |
 | Source control | GitHub REST API v3 with a fine-grained PAT |
@@ -36,49 +47,64 @@ Sentinel is a closed-loop, 5-agent system built with the Python **uAgents** fram
 | Demo target | FastAPI + uvicorn (`demo_target_app/`) |
 | Config | `python-dotenv`, `.env` file |
 | Tests | `pytest`, `pytest-asyncio`, `respx` (for mocking httpx **in tests only**) |
+| Version checks | `packaging` (reads PyPI's `requires_dist`) |
 
 ---
 
 ## 3. Repository Layout
 
-
+```
 Project/
-├── CLAUDE.md
-├── README.md                        # Hackathon badges + agent registry table (see §13)
-├── requirements.txt
-├── .env.example
-├── docker-compose.yml               # 5 agents + demo target app
-├── common/
-│   ├── __init__.py
-│   ├── config.py                    # Loads .env, exposes typed settings (single source of config)
-│   ├── models.py                    # ALL inter-agent uagents.Model schemas (§6) — only place they live
-│   ├── addresses.py                 # Agent addresses derived from seeds / read from env
-│   ├── asi1_client.py               # Async ASI:One chat-completions wrapper + JSON-mode helper
-│   ├── github_client.py             # Commits, diffs, file contents, branches, commits, PRs
-│   ├── osv_client.py                # OSV batch query + manifest parsing + reachability classification
-│   ├── sast_rules.py                # Regex/AST SAST rule set
-│   ├── ast_mapper.py                # Python `ast` import & call-symbol extractor
-│   ├── sbom_generator.py            # CycloneDX v1.5 JSON builder
-│   ├── dorado.py                    # cosmpy tx verification helper
-│   └── logging.py                   # Structured log helper: [incident_id][agent][stage] message
-├── agents/
-│   ├── Agent_1.py     # :8001
-│   ├── Agent_2.py        # :8002
-│   ├── Agent_3.py          # :8003
-│   ├── Agent_4.py          # :8004
-│   └── Agent_5.py      # :8005
-├── demo_target_app/
-│   ├── app.py
-│   ├── requirements.txt             # deliberately vulnerable pins
-│   └── Dockerfile                   # deliberately insecure
-└── tests/
-    ├── test_models.py
-    ├── test_osv_client.py
-    ├── test_sast_rules.py
-    ├── test_ast_mapper.py
-    ├── test_sbom_generator.py
-    └── test_end_to_end_pipeline.py
+├── agents/                 # one process each, thin: handlers and orchestration
+│   ├── Agent_1.py          # :8001 Manager: incident state machine, approval gate
+│   ├── Agent_2.py          # :8002 Health Checker: probes, chaos, canary
+│   ├── Agent_3.py          # :8003 Detective: failing line, commit blame, reads the code
+│   ├── Agent_4.py          # :8004 Security Inspector: CVEs, SAST, patch gatekeeper
+│   └── Agent_5.py          # :8005 Fixer: drafts, verdicts, pull requests
+├── common/                 # pure, tested logic shared by the agents
+│   ├── config.py           # the single source of settings
+│   ├── models.py           # ALL inter-agent message schemas (§6)
+│   ├── llm_client.py       # provider-neutral LLM client (Groq, Gemini, ASI:One)
+│   ├── github_client.py    # commits, files, branches, PRs; the write allowlist
+│   ├── osv_client.py       # OSV queries, manifests, reachability
+│   ├── sast_rules.py       # code rules, secret masking
+│   ├── ast_mapper.py       # imports and call symbols
+│   ├── commit_scoring.py   # error location and commit blame
+│   ├── code_search.py      # ranks a repository's code by a report's words
+│   ├── gatekeeper.py       # the checks a patch must pass
+│   ├── code_checks.py      # undefined names and bad stdlib attributes, without running code
+│   ├── dependency_check.py # can these pins install together (PyPI)
+│   ├── patching.py         # diffs, secret and yaml hardening, version bumps
+│   ├── remediation.py      # branch, commit, SBOM, PR, webhook
+│   ├── sbom_generator.py   # CycloneDX v1.5
+│   ├── url_safety.py       # SSRF protection
+│   ├── activity.py         # live activity events
+│   ├── agent_factory.py    # agent construction, local mode
+│   ├── addresses.py        # agent addresses from seeds
+│   ├── http_retry.py       # shared retry policy
+│   ├── probe.py, intent.py, logging.py
+│   └── dorado.py, blast_radius.py, incident_card.py    # dormant ASI:One and payment path
+├── web/                    # the console's backend
+│   ├── server.py           # FastAPI, WebSocket, sign-in, serves frontend/dist
+│   ├── assistant.py        # the chat LLM and its tools
+│   ├── console.py          # sessions, ownership, starting cases
+│   ├── gateway.py          # the uAgent that bridges to Agent_1 (:8006)
+│   ├── views.py            # Agent_1's record -> what the chat shows
+│   └── auth.py             # password, same-origin, public-bind checks
+├── frontend/src/           # React chat UI
+├── scripts/
+│   ├── run_stack.py        # supervisor: everything in one process tree (Docker entry point)
+│   ├── start_demo.ps1      # Windows start and stop
+│   └── seed_demo_repo.py   # builds the demo repository's history
+├── demo_target_app/        # the deliberately broken demo service: do not fix it
+├── tests/                  # pytest; external services mocked (tests/fakes.py)
+├── docs/images/            # README screenshots
+├── Dockerfile, .dockerignore, docker-compose.yml
+├── requirements.txt, pytest.ini, .env.example
+└── README.md, CLAUDE.md
+```
 
+`websockets` looks unused in `requirements.txt` but uvicorn needs it for `/ws`. Keep it.
 
 Do not create extra top-level folders without a reason. Shared logic goes in `common/`; agent files stay thin (handlers + orchestration only).
 
@@ -88,7 +114,7 @@ Do not create extra top-level folders without a reason. Shared logic goes in `co
 
 
 # Setup
-python -m venv .venv && source .venv/bin/activate
+python -m venv venv                # then activate it
 pip install -r requirements.txt
 cp .env.example .env            # then fill in values
 
@@ -110,18 +136,42 @@ pytest -q
 pytest tests/test_osv_client.py -q        # single file
 pytest -m integration -q                  # opt-in live OSV.dev call (deselected by default)
 
-# Step 11 helpers (Windows PowerShell)
+# Helpers (Windows PowerShell)
 python -m scripts.seed_demo_repo [--create] [--reset]   # build the demo repo history (parent commit + faulty commit)
-python -m scripts.show_addresses [--markdown]           # agent addresses from the seeds (never prints seeds)
 .\scripts\start_demo.ps1 [-SkipPayment] [-NoDemoApp] [-Stop]   # demo app :9000 + all 5 agents in separate windows
+
+# Web console (the product; local mode, no payment)
+.\scripts\start_demo.ps1 -Web                 # one window running scripts.run_stack (restarts a stopped agent), waits until all agents are online; always includes the demo app
+python -m web.server                          # backend only: FastAPI + chat assistant + gateway agent (:8006)
+cd frontend; npm install; npm run dev         # React dev server on :5173 (proxies /api and /ws to :8080)
+cd frontend; npm run build                    # production build to frontend/dist (served by web.server)
+cd frontend; npm run typecheck
+
+# One command, any OS (also the Docker entry point): demo app + 5 agents + console, restarts crashed processes
+python -m scripts.run_stack
+docker compose up --build                     # needs CONSOLE_PASSWORD in .env; one container, publish only :8080
+docker build -t sentinel:local .              # the image hosts run. It honours the host's PORT
 ```
+
+> **Deployment:** one container (`Dockerfile`, `.dockerignore`, `docker-compose.yml`) because the agents reach each other on 127.0.0.1. Port: `WEB_PORT`, then the host's `PORT`, then 8080; the image must not set `WEB_PORT`, or a host's port is ignored. It needs about 1 GB of memory. `web/auth.py`: the server refuses to bind beyond loopback without `CONSOLE_PASSWORD`, and cross-site POST/WebSocket requests are rejected. In local mode (`common/agent_factory.py`) agents do not register on Almanac or Agentverse at all. `web/assistant.py` only accepts a URL or repo the user actually typed (Gemini invented one in a live run). The stack idles at about 430 MB. Top-level `requirements.txt` versions are pinned. If the suspect commit is Sentinel's own merged forward fix (`commit_scoring.sentinel_fix_title`, matched on the PR title in the merge message), Agent_1 stops with `FAILED` and a redeploy hint instead of patching or offering a rollback; a merged rollback is treated as a real cause. The bundled demo app runs local code, so merging a Sentinel PR ends the demo until `seed_demo_repo --reset`.
+>
+> **Web console (post-hackathon):** `web/` (backend) + `frontend/` (React, Vite, Tailwind, chat-first). Browser ⇄ WebSocket ⇄ `web/server.py` → `web/assistant.py` (LLM with tools `run_sentinel`, `get_incidents`) → `web/console.py` → `web/gateway.py` (uAgent on :8006) → Agent_1.
+> - **No default targets.** The assistant has no default repo or URL; a repo or URL only counts if the user typed it (Gemini invented one in a live run). It can never approve. The console resolves the real default branch (`GitHubClient.get_repo`) and passes it through every agent; never assume `main`.
+> - **Sessions.** Each browser is a `Session` (cookie `sentinel_session`, `web/console.py`). The console creates the incident id, so `owners` maps every update, file and decision to one session. Decisions and downloads check ownership. `web/views.py` turns Agent_1's record into what the chat shows. The transcript lives on the server, so a refresh loses nothing.
+> - **Messages.** `IncidentRequest` (console → Agent_1, accepted only from the gateway; nothing falls back to configured repos), `IncidentUpdate` (Agent_1 → gateway, full record instead of Markdown: `_say` sends this when `inc["source"] == "web"`), `AgentActivity` (every agent → gateway, via `common/activity.py`; real events, best effort, no-op outside local mode). Approve/Reject is `POST /api/incidents/{id}/decision` from a click, forwarded as chat text `approve <id>`. `GET :8001/incidents` is now only a light heartbeat.
+> - **Web incident rules (Agent_1).** The service URL is optional. A healthy or unreachable probe does not end the case (`service_note`). No error location means Agent_3 picks the file with the LLM from the repo tree (`_llm_locate`), `confidence="low"`, the suspect SHA is withheld from the gatekeeper and `must_remove_fault` is off. Repo in `Settings.writable_repos`: `AWAITING_APPROVAL`, then a PR. Otherwise `RESOLVED` with `delivery="files"` and no GitHub write (`GET /api/incidents/{id}/files/{n}`). No rollback in the web flow: a rejected fix ends in `FAILED`. No redeploy means no canary. A web security audit sends an empty endpoint and snippet, so Agent_3 only maps imports (no LLM), and Agent_4 scans all Python sources (`modified_files=["*"]`).
+> - **Gatekeeper for real code.** `check_sast(target, patched, original)` rejects only *new* findings; a CVE with no published fix does not block; only packages already in `requirements.txt` are held to a bump. This relaxes §5.4 on purpose. `check_references` (`common/code_checks.py`) rejects new undefined names and standard-library attributes that don't exist. `new_conflicts` (`common/dependency_check.py`) rejects pins that can't install together, from each release's `requires_dist` on PyPI; `companion_upgrades` moves the other pins first, and PyPI being down blocks nothing. Sentinel never runs a repository's code, so the card says "Passed the security check" and "I haven't run this code". That badge means safe to review, not correct.
+> - **Finding the fault.** The chat passes the user's own words to the agents with the model's summary (`web/assistant.py`), because summaries drop tracebacks. With a location, Agent_3 resolves it to a repository file (`locate_in_repo`, innermost frame in this repo) and blames a commit only if a hunk covers that line (`changed_error_line`). Otherwise no commit is blamed, `offending_diff_snippet` is empty and `must_remove_fault` is off: demanding that an innocent commit's lines go deleted working code in a live run. With only a description, `_llm_locate` sends the files most related to the report (`common/code_search.py`), not just file names. If the model names no file, the top keyword match goes to the Fixer, which can still answer `no_bug`; a report that matches no code ends as `offending_file="unknown"`.
+> - **Fixer verdicts.** The LLM answers `fixed`, `no_bug` or `dependencies_only`. `no_bug`, or a file returned unchanged, ends the case with `PatchDraftResult.no_bug` and no retry: retrying "no changes" pressured the model into breaking correct code. `dependencies_only` retargets the case to `requirements.txt`. `PatchDraftResult.upgrades` lists every pin the fix moves, and the card shows them. One case changes one code file; "fix everything" is not supported, and the fix is never run.
+> - **Exposure.** `common/url_safety.py` refuses private/loopback/metadata targets on a public host (allowed when the console itself binds to loopback, and for the demo URL). The admin token only goes to the host of `DEMO_SERVICE_URL`, and chaos tests only run against it. With `CONSOLE_PASSWORD` set the whole console needs it.
+> - **LLM.** Provider via `LLM_PROVIDER=groq|gemini|asi1`, `common/llm_client.py`. The owner chose Groq's `openai/gpt-oss-20b`, called directly on Groq's OpenAI-compatible endpoint (no LangChain). `GROQ_API_KEY` may live in `.env` or the machine's environment. Gemini's free plan allows only 20 requests a day per model, and one case uses about 3. Groq's free plan allows 1,000 requests but only 8,000 tokens a minute, so `Settings.llm_context_chars` is 6,000 on Groq (40,000 otherwise; `LLM_CONTEXT_CHARS` overrides it), short 429s are waited out via `retry-after`, and intermittent `output_parse_failed` 400s are retried. Never use Groq's JSON mode for patches: in a live test its code came back double-escaped. gpt-oss-20b often answers an empty file at the locate step, so `_llm_locate` falls back to the top keyword match and the Fixer judges it. With a fallback model the primary gets one attempt: the fallback is the retry. Agent_5 has a 90 s timeout. Gateway seed: `GATEWAY_SEED`, else derived from `ORCHESTRATOR_SEED`.
 
 When you add a new command or script, update this section.
 
 ---
 
 ## 5. The Five Agents 
-> **Naming (renamed after Step 11):** the agents are named and filed by port: `Agent_1`=Sentinel-Orchestrator (8001), `Agent_2`=Telemetry-Watchdog (8002), `Agent_3`=Commit-Detective (8003), `Agent_4`=Vuln-CVE-Scanner (8004), `Agent_5`=Remediation-Executor (8005). Files are `agents/Agent_N.py`, run with `python -m agents.Agent_N`; READMEs are `agents/readmes/Agent_N.md`. The role names used in this document are descriptive roles for those agents. Seeds and addresses are unchanged.
+> **Naming (renamed after Step 11):** the agents are named and filed by port: `Agent_1`=Sentinel-Orchestrator (8001), `Agent_2`=Telemetry-Watchdog (8002), `Agent_3`=Commit-Detective (8003), `Agent_4`=Vuln-CVE-Scanner (8004), `Agent_5`=Remediation-Executor (8005). Files are `agents/Agent_N.py`, run with `python -m agents.Agent_N`. The role names used in this document are descriptive roles for those agents. Seeds and addresses are unchanged.
 
 
 All agents: `Agent(name=..., seed=<from env>, port=<port>, mailbox=True, publish_agent_details=True)` where supported by the installed uagents version. Each runs as its **own process** (do not put them in a `Bureau`, because each needs its own mailbox/Agentverse identity). Agents talk to each other by address, imported from `common/addresses.py`.
@@ -352,7 +402,7 @@ class RemediationCompletionReport(Model):
 
 Additional small models you may add (keep them in the same file):
 - `AgentErrorReport(incident_id: str, agent: str, stage: str, error: str)` — any agent sends this to the orchestrator instead of silently failing.
-- `PatchDraftResult(incident_id: str, attestation: SecurityApprovalAttestation, rollback_available: bool, attempts: int)` — executor → orchestrator after the gatekeeper loop.
+- `PatchDraftResult(incident_id: str, attestation: SecurityApprovalAttestation, rollback_available: bool, attempts: int)` — executor → orchestrator after the gatekeeper loop. 
 
 uAgents message size is limited — keep `patched_code_content` and diffs to single files and truncate snippets for display. If a payload could exceed ~200 KB, store the content on GitHub/branch and pass a reference instead.
 
@@ -461,7 +511,7 @@ client = LedgerClient(NetworkConfig.fetchai_stable_testnet())   # Dorado
 
 Verify: tx found, `code == 0`, contains a bank `MsgSend` to `ORCHESTRATOR_WALLET_ADDRESS` with `atestfet` amount ≥ required, and hash not previously used. Retry lookup up to 5× with 3 s backoff (tx may not be indexed yet). Explorer link: `https://explore-dorado.fetch.ai/transactions/{tx_hash}` (make the base URL an env var).
 
-### 9.4 ASI:One LLM (`common/asi1_client.py`)
+### 9.4 ASI:One LLM (now `common/llm_client.py`)
 - `POST https://api.asi1.ai/v1/chat/completions`, header `Authorization: Bearer $ASI1_API_KEY`, model from env `ASI1_MODEL` (default `asi1-mini`).
 - Provide `chat_json(system, user, schema_hint) -> dict`: asks for JSON only, strips ```json fences, `json.loads`, one retry on parse failure, then raises `LLMError`.
 - Timeout 30 s, temperature 0.2. Never send secrets (mask them first) or whole repositories to the LLM — truncate to what's needed.
@@ -518,59 +568,15 @@ A small FastAPI app (~60–100 lines) in a **separate GitHub repo we control** (
 
 ---
 
-## 12. Environment Variables (`.env.example`)
+## 12. Environment Variables
 
-
-# ASI:One
-ASI1_API_KEY=
-ASI1_MODEL=asi1-mini
-
-# GitHub (fine-grained PAT: Contents RW + Pull requests RW on the demo repo only)
-GITHUB_TOKEN=
-DEMO_REPO_FULL_NAME=your-org/sentinel-target
-DEMO_SERVICE_URL=https://sentinel-target.onrender.com
-DEMO_ADMIN_TOKEN=change-me
-
-# Agent seeds (unique, long, secret)
-ORCHESTRATOR_SEED=
-WATCHDOG_SEED=
-DETECTIVE_SEED=
-SCANNER_SEED=
-EXECUTOR_SEED=
-
-# Payment / chain
-ORCHESTRATOR_WALLET_ADDRESS=fetch1...
-REMEDIATION_PRICE_ATESTFET=100000000000000000
-DORADO_EXPLORER_BASE=https://explore-dorado.fetch.ai/transactions
-
-# Watchdog
-WATCHDOG_TARGETS=
-WATCHDOG_INTERVAL_SECONDS=60
-
-# Blast radius assumptions
-TRAFFIC_RPM=120
-AVG_ORDER_VALUE_USD=40
-CONVERSION_RATE=0.03
-SLA_TARGET=0.999
-
-
-Never commit `.env`. Never hardcode any of these values in source.
+`.env.example` is the reference: required values first, then optional, then the dormant hackathon settings. Never commit `.env`. Never hardcode any of these values in source, and never put a real value in `.env.example`.
 
 ---
 
-## 13. README Requirements (Fetch-A-Thon 3.0 checklist)
+## 13. README
 
-The README is graded. It must contain, in this order:
-1. At the very top:
-   ```markdown
-   ![tag:innovationlab](https://img.shields.io/badge/innovationlab-3D8BD3)
-   ![tag:hackathon](https://img.shields.io/badge/hackathon-5F43F1)
-   ```
-2. One-paragraph pitch + architecture diagram (ASCII is fine).
-3. **Agent registry table**: Name | Address (`agent1q...`) | Agentverse profile URL | Port — for all 5 agents. Leave placeholders until real addresses exist; never invent addresses.
-4. ASI:One shared chat URL (placeholder until recorded).
-5. Demo video link (3–5 min).
-6. Setup & run instructions, env vars, tech stack, and the sponsor tools used.
+The README is the project's public face, written for recruiters and engineers. Keep its numbers true: test count, measured results and limits. The hackathon's badge and registry requirements no longer apply.
 
 ---
 

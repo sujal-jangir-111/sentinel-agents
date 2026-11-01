@@ -369,3 +369,36 @@ async def test_live_github_reads_public_repo():
         gh = GitHubClient(http, token=token, write_allowlist=[])
         commits = await gh.list_commits("octocat/Hello-World", "master", per_page=1)
     assert len(commits) == 1 and commits[0].sha
+
+
+# ------------------------------------------------------------------ finding the code in a real project
+
+def tree_client(paths):
+    """A client whose repository tree holds `paths`; every file's content is its own path."""
+    import base64
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = request.url.path
+        if "/git/trees/" in url:
+            return httpx.Response(200, json={"tree": [{"path": p, "type": "blob"} for p in paths]})
+        path = url.split("/contents/", 1)[1]
+        return httpx.Response(200, json={"type": "file", "encoding": "base64", "sha": "s",
+                                         "content": base64.b64encode(path.encode()).decode()})
+
+    return GitHubClient(httpx.AsyncClient(transport=httpx.MockTransport(handler)), token="t", write_allowlist=[])
+
+
+async def test_python_code_is_found_in_nested_packages():
+    """Regression: pallets/click keeps its code in src/click/, which used to scan as 0 files and report no problems."""
+    gh = tree_client(["src/click/core.py", "src/click/types.py", "README.md"])
+    assert sorted(await gh.fetch_python_sources("pallets/click", "main")) == ["src/click/core.py", "src/click/types.py"]
+
+
+async def test_application_code_is_kept_before_tests_when_a_repo_hits_the_cap():
+    gh = tree_client(["tests/test_a.py", "docs/conf.py", "test_root.py", "pkg/deep/er/mod.py", "pkg/core.py"])
+    assert list(await gh.fetch_python_sources("a/b", "main", cap=2)) == ["pkg/core.py", "pkg/deep/er/mod.py"]
+
+
+async def test_vendored_folders_are_not_treated_as_the_project():
+    gh = tree_client(["node_modules/x/y.py", "venv/lib/z.py", "app.py"])
+    assert list(await gh.fetch_python_sources("a/b", "main")) == ["app.py"]

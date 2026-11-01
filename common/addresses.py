@@ -28,3 +28,17 @@ def agent_address(key: str) -> Optional[str]:
 
 def all_addresses() -> Dict[str, Optional[str]]:
     return {key: agent_address(key) for key in AGENT_KEYS}
+
+
+def gateway_seed() -> str:
+    """Seed of the web gateway agent: GATEWAY_SEED, else derived from ORCHESTRATOR_SEED (stable, never printed)."""
+    explicit = os.getenv("GATEWAY_SEED", "").strip()
+    if explicit:
+        return explicit
+    base = get_settings().orchestrator_seed
+    return f"{base}/web-gateway" if base else ""
+
+
+def gateway_address() -> Optional[str]:
+    seed = gateway_seed()
+    return address_from_seed(seed) if seed else None

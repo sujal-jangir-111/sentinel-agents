@@ -8,7 +8,7 @@ from uagents_core.contrib.protocols.chat import (
 )
 
 from agents.Agent_1 import Orchestrator, create_agent, make_chat
-from common.asi1_client import ASI1Client
+from common.llm_client import ASI1Client
 from common.config import Settings
 from common.models import (
     AgentErrorReport, CommitCorrelationRequest, HealthProbeRequest, PatchDraftRequest, VulnerabilityScanRequest,
@@ -72,6 +72,48 @@ async def to_awaiting_approval(orch, ctx, **patch_kw) -> str:
     await orch.handle_vuln_report(ctx, ADDR["scanner"], make_vuln_report(inc))
     await orch.handle_patch_result(ctx, ADDR["executor"], make_patch_result(inc, **patch_kw))
     return inc
+
+
+# ------------------------------------------------------------------ Sentinel's own fix must never be undone
+
+MERGED_FIX = "Merge pull request #2 from me/sentinel/fix-inc-51626f69\n\nSentinel inc-51626f69: fix app.py"
+MERGED_ROLLBACK = "Merge pull request #3 from me/sentinel/fix-inc-d5faec4b\n\nSentinel inc-d5faec4b: roll back app.py"
+
+
+def blaming(inc: str, message: str):
+    evidence = make_evidence(inc)
+    return type(evidence).model_validate({**evidence.dict(), "commit_message": message})
+
+
+async def test_merged_sentinel_fix_is_not_patched_or_rolled_back(ctx):
+    """Regression (live): a chaos test after the fix was merged blamed the fix, and Sentinel offered to roll it back."""
+    orch = make_orch()
+    inc = await start(orch, ctx)
+    await orch.handle_probe_report(ctx, ADDR["watchdog"], make_probe_report(inc))
+    await orch.handle_evidence(ctx, ADDR["detective"], blaming(inc, MERGED_FIX))
+    assert stored(ctx, inc)["state"] == "FAILED"
+    assert sent(ctx, ADDR["scanner"], VulnerabilityScanRequest) == [] and sent(ctx, ADDR["executor"], PatchDraftRequest) == []
+    last = texts(ctx)[-1]
+    assert "Nothing to patch" in last and "Sentinel inc-51626f69: fix app.py" in last and "Redeploy" in last
+    await orch.handle_chat(ctx, USER, chat("rollback"))                             # and no rollback can be authorized
+    assert stored(ctx, inc)["state"] == "FAILED" and "Nothing is waiting" in texts(ctx)[-1]
+
+
+async def test_a_merged_rollback_is_still_treated_as_a_real_cause(ctx):
+    """A rollback really can bring a bug back, so it must go through the normal patch flow."""
+    orch = make_orch()
+    inc = await start(orch, ctx)
+    await orch.handle_probe_report(ctx, ADDR["watchdog"], make_probe_report(inc))
+    await orch.handle_evidence(ctx, ADDR["detective"], blaming(inc, MERGED_ROLLBACK))
+    assert stored(ctx, inc)["state"] == "SCANNING" and len(sent(ctx, ADDR["scanner"], VulnerabilityScanRequest)) == 1
+
+
+async def test_a_security_audit_still_runs_when_the_newest_commit_is_a_sentinel_fix(ctx):
+    orch = make_orch()
+    await orch.handle_chat(ctx, USER, chat(f"security audit of {REPO}"))
+    inc = sent(ctx, ADDR["detective"], CommitCorrelationRequest)[0].incident_id
+    await orch.handle_evidence(ctx, ADDR["detective"], blaming(inc, MERGED_FIX))
+    assert stored(ctx, inc)["state"] == "SCANNING"
 
 
 # ------------------------------------------------------------------ chat protocol basics
@@ -342,14 +384,14 @@ async def test_stage_timeouts_fail_the_incident_with_a_recovery_hint(ctx):
     assert "Timed out after 60s" in texts(ctx)[-1] and "Agent_2" in texts(ctx)[-1] and "Recovery" in texts(ctx)[-1]
 
 
-async def test_patching_gets_120_seconds(ctx):
+async def test_patching_gets_180_seconds(ctx):
     clock = Clock()
     orch = make_orch(clock=clock)
     inc = await start(orch, ctx)
     await orch.handle_probe_report(ctx, ADDR["watchdog"], make_probe_report(inc))
     await orch.handle_evidence(ctx, ADDR["detective"], make_evidence(inc))
     await orch.handle_vuln_report(ctx, ADDR["scanner"], make_vuln_report(inc))
-    clock.t += 100
+    clock.t += 170
     await orch.sweep(ctx)
     assert stored(ctx, inc)["state"] == "PATCHING"
     clock.t += 21

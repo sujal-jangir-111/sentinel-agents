@@ -1,0 +1,17 @@
+# docker compose up --build     then open http://127.0.0.1:8080
+# Reads secrets from .env. Bound to loopback here; put a TLS proxy in front to expose it.
+services:
+  sentinel:
+    build: .
+    env_file: .env
+    environment:
+      CONSOLE_PASSWORD: ${CONSOLE_PASSWORD:?set CONSOLE_PASSWORD in .env}
+      DEMO_SERVICE_URL: http://127.0.0.1:9000
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - sentinel-data:/data     # keeps incident history across restarts
+    restart: unless-stopped
+
+volumes:
+  sentinel-data:

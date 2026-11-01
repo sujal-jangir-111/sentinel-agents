@@ -36,7 +36,7 @@ async def demo_http():
 
 
 def make_watchdog(http, **kw) -> Watchdog:
-    return Watchdog(http=http, admin_token=kw.pop("admin_token", TOKEN),
+    return Watchdog(http=http, admin_token=kw.pop("admin_token", TOKEN), demo_url=kw.pop("demo_url", req().service_url),
                     orchestrator_address=kw.pop("orchestrator_address", ORCH), targets=kw.pop("targets", []))
 
 
@@ -83,6 +83,15 @@ async def test_chaos_injection_breaks_a_patched_service(demo_http, ctx):
     report, = reports(ctx)
     assert report.is_healthy is False
     assert {m.status_code for m in report.metrics if m.endpoint == "/api/checkout"} == {500}
+
+
+async def test_admin_token_is_never_sent_to_a_url_a_user_typed(demo_http, ctx):
+    """Regression: the chaos call used to post the demo token to any service URL."""
+    wd = make_watchdog(demo_http, demo_url="http://the-configured-demo.example")
+    await demo_http.post("/admin/apply-hotfix", headers={"X-Sentinel-Token": TOKEN})
+    await wd.handle_probe_request(ctx, "s", req(inject_chaos=True))
+    report, = reports(ctx)
+    assert report.is_healthy is True                                  # the token was withheld, so nothing was broken
 
 
 async def test_chaos_with_wrong_token_does_not_break_probe(demo_http, ctx):
