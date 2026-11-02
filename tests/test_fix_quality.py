@@ -185,6 +185,20 @@ async def test_a_model_that_shrugs_gets_the_keyword_match_for_the_fixer_to_check
     assert ev.offending_file == "store/cart.py" and ev.confidence == "low"
 
 
+async def test_a_file_the_model_never_read_does_not_beat_one_that_matches(ctx):
+    """Live: asked about a restock alert, gpt-oss-20b named store/inventory.py from the file list without reading it, over
+    store/stock_alerts.py, which it was shown. The Fixer then 'fixed' unrelated bugs there."""
+    web = store_web()
+    web.github.files["store/inventory.py"] = "def reserve(sku, quantity):\n    return STOCK[sku] > quantity\n"
+    web.github.files["store/stock_alerts.py"] = 'def needs_restock(units_left):\n    """Alert when 5 or fewer units are left."""\n    return units_left <= 5\n'
+    web.github.commits = [commit_json("c" * 40, "x", "2026-02-01T00:00:00Z", [])]
+    calls = []
+    web.llm = lambda r: (calls.append(1), llm_reply(json.dumps({"file": "store/inventory.py", "sha": ""}) if len(calls) == 1 else "x"))[1]
+    await detective(web).handle_request(ctx, "orch", report("We don't get a restock alert when exactly 5 units are left"))
+    (_, ev), = ctx.sent
+    assert ev.offending_file == "store/stock_alerts.py"
+
+
 def test_files_unrelated_to_the_report_are_not_sent():
     context = code_context("cart coupon", {"store/cart.py": "coupon", "store/tax.py": "rates", "store/users.py": "email"})
     assert "store/cart.py" in context and "store/tax.py" not in context and "store/users.py" not in context
