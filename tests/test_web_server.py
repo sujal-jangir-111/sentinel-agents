@@ -266,6 +266,14 @@ def test_the_page_never_shows_a_configured_repo(web):
     assert "repo" not in json.dumps(web.get("/api/health").json()).lower()
 
 
+def test_health_says_which_commit_is_running(web, monkeypatch):
+    """A push that never redeployed looked exactly like one that had: the live site must say what it runs."""
+    monkeypatch.setenv("RENDER_GIT_COMMIT", "464cad0f1e2d3c4b5a69788796a5b4c3d2e1f0a9")
+    assert web.get("/api/health").json()["version"] == "464cad0"
+    monkeypatch.delenv("RENDER_GIT_COMMIT")
+    assert web.get("/api/health").json()["version"] == ""
+
+
 # ------------------------------------------------------------------ sign-in and cross-site
 
 @pytest.fixture

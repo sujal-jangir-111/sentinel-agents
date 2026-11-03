@@ -100,7 +100,9 @@ def require_session(request: Request) -> Session:
 
 @app.get("/api/health")
 async def health() -> Dict[str, Any]:
-    return {"ok": True, "agents_online": console.agents_online, "assistant_model": get_settings().llm_assistant_model}
+    # The commit Render built, so a redeploy can be confirmed from outside (pushes don't always redeploy)
+    return {"ok": True, "agents_online": console.agents_online, "assistant_model": get_settings().llm_assistant_model,
+            "version": os.getenv("RENDER_GIT_COMMIT", "")[:7]}
 
 
 @app.get("/api/session")

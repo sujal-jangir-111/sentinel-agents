@@ -12,7 +12,7 @@
 ![FastAPI](https://img.shields.io/badge/FastAPI-WebSockets-009688?style=flat-square&logo=fastapi&logoColor=white)
 ![React](https://img.shields.io/badge/React_19-TypeScript-61DAFB?style=flat-square&logo=react&logoColor=black)
 ![Docker](https://img.shields.io/badge/Docker-226_MB-2496ED?style=flat-square&logo=docker&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-594_passing-2EA44F?style=flat-square)
+![Tests](https://img.shields.io/badge/tests-595_passing-2EA44F?style=flat-square)
 
 <br>
 
@@ -199,7 +199,7 @@ The first run looked fine in the UI, with a green "safety check" badge on every 
 | **Security data** | OSV.dev, PyPI metadata, custom SAST rules, Python `ast` import mapping, CycloneDX 1.5 SBOM |
 | **Integrations** | GitHub REST API |
 | **Delivery** | Docker (multi-stage, non-root, 226 MB), process supervisor, healthcheck |
-| **Testing** | pytest, pytest-asyncio, respx: 594 tests, plus real-browser journeys and the answer key above |
+| **Testing** | pytest, pytest-asyncio, respx: 595 tests, plus real-browser journeys and the answer key above |
 
 <br>
 
@@ -316,7 +316,7 @@ Free services sleep after 15 idle minutes, so the first visit after a quiet spel
 ├── frontend/          The React chat interface
 ├── scripts/           Process supervisor, Windows start script, demo repository builder
 ├── demo_target_app/   A deliberately broken service to try Sentinel on
-├── tests/             594 tests, including regressions for every bug found in live runs
+├── tests/             595 tests, including regressions for every bug found in live runs
 ├── docs/images/       The screenshots above
 ├── Dockerfile         One image with everything in it
 ├── docker-compose.yml
