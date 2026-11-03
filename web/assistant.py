@@ -15,6 +15,7 @@ from common.llm_client import LLMClient, LLMError
 MAX_TOOL_ROUNDS = 3
 HISTORY_TURNS = 20
 OWN_WORDS_TURNS = 3
+FIX_WORDS = re.compile(r"\b(fix|fixes|fixed|fixing|repair|patch|resolve|solve)\b", re.IGNORECASE)
 MIN_REPORT_WORDS = 4    # "yes, go" is consent, not a report
 MODES = ("diagnose_and_heal", "security_audit", "chaos_test")
 
@@ -27,7 +28,8 @@ How to help:
   in one short sentence. Never guess or invent a repository or URL.
 - A live service URL is optional, but ask for nothing extra if you already have a repository and a problem.
 - As soon as you have them, call run_sentinel with mode diagnose_and_heal and the user's own words as the problem.
-- For a vulnerability or security check of a repository, call run_sentinel with mode security_audit.
+- For a vulnerability or security check of a repository, call run_sentinel with mode security_audit. If the user asks you
+  to fix something, even a security problem, use diagnose_and_heal: security_audit only lists problems and changes nothing.
 - Only use chaos_test if the user explicitly asks for a chaos test.
 - For questions about the current case, call get_incidents and answer from that data only.
 - You cannot approve or reject a change. If the user asks you to, tell them to use the buttons on the card in this chat.
@@ -118,7 +120,9 @@ class Assistant:
             return {"error": f"mode must be one of {list(MODES)}"}
         repo = extract_github_repo(str(args.get("repo") or ""))
         url = extract_service_url(str(args.get("service_url") or "")) or ""
-        problem = str(args.get("problem") or "").strip()
+        problem = _with_own_words(str(args.get("problem") or "").strip(), words)
+        if mode == "security_audit" and FIX_WORDS.search(words):   # live: "A security review found ... Please fix it" got a scan
+            mode = "diagnose_and_heal"
         # Models invent plausible targets (seen live: http://checkout:8080). Only the user chooses what gets touched.
         if not repo or not _typed(repo, said):
             return {"error": "the user has not given a GitHub repository: ask them for the link"}
@@ -128,7 +132,7 @@ class Assistant:
             return {"error": "the user has not said what is wrong: ask them"}
         if mode == "chaos_test" and not url:
             return {"error": "a chaos test needs the service URL: ask the user for it"}
-        return await self.actions.start(mode, repo, _with_own_words(problem, words), url)
+        return await self.actions.start(mode, repo, problem, url)
 
 
 def _own_words(turns: List[str]) -> str:

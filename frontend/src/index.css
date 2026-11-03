@@ -84,6 +84,7 @@ button:disabled { cursor: not-allowed; }
 .prose-chat ul { list-style: disc; padding-left: 1.25rem; margin: 0.4rem 0; }
 .prose-chat ol { list-style: decimal; padding-left: 1.25rem; margin: 0.4rem 0; }
 .prose-chat a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+code, pre, kbd, .font-mono { font-variant-ligatures: none; font-feature-settings: "liga" 0, "calt" 0; }
 .prose-chat code { font-family: var(--font-mono); font-size: 0.85em; background: var(--sunken); border-radius: 5px; padding: 0.1em 0.35em; }
 .prose-chat pre { background: var(--sunken); border-radius: 10px; padding: 0.75rem; overflow-x: auto; margin: 0.5rem 0; }
 .prose-chat pre code { background: none; padding: 0; }

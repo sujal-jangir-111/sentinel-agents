@@ -122,7 +122,8 @@ class CommitDetective:
         if offending_file == "unknown":
             await activity(ctx, inc, AGENT_NAME, "No file in this repository fits the report", DONE)
         else:
-            await activity(ctx, inc, AGENT_NAME, f"Found it: {offending_file}" + (f", commit {commit.sha[:7]}" if commit else ""), DONE)
+            found = "Best match" if described_only else "Found it"
+            await activity(ctx, inc, AGENT_NAME, f"{found}: {offending_file}" + (f", commit {commit.sha[:7]}" if commit else ""), DONE)
         return CommitEvidenceReport(
             incident_id=inc, repo_full_name=repo, suspect_commit_sha=commit.sha if commit else "",
             suspect_commit_url=commit.url if commit else "", author=commit.author if commit else "",

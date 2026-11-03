@@ -256,6 +256,34 @@ async def test_correct_code_is_left_alone(ctx):
     assert len(prompts) == 1 and not result.attestation.approved
 
 
+async def test_a_password_in_the_code_is_fixed_even_when_the_model_sees_no_bug(ctx):
+    """Live: the model is shown the file after secrets are moved to os.getenv, so for a report about a hardcoded password
+    it answered "already read from an environment variable" and the password stayed in the code."""
+    web = store_web()
+    web.github.files["requirements.txt"] = "pyyaml==5.3\n"
+    web.github.files["store/mailer.py"] = 'SMTP_PASSWORD = "Shop-Mail-2026-pass"\n\n\ndef send():\n    return SMTP_PASSWORD\n'
+    web.llm = lambda r: llm_reply(json.dumps({"verdict": "no_bug", "patched_code": "x", "explanation": "Already uses os.getenv."}))
+    await executor(web).handle_patch_draft_request(ctx, "orch", draft(web, "store/mailer.py", "our email password is in the code"))
+    (_, vetting), = ctx.sent
+    assert isinstance(vetting, PatchVettingRequest) and vetting.target_file == "store/mailer.py"
+    assert 'os.getenv("SMTP_PASSWORD")' in vetting.patched_code_content and "Shop-Mail-2026-pass" not in vetting.patched_code_content
+    assert "environment variable" in json.loads(ctx.storage.get(f"loop:{INC}"))["explanation"]
+
+
+async def test_asking_for_a_fix_starts_a_fix_even_about_security():
+    """Live: "A security review found an email password ... Please fix it" made the model start a scan, which changes nothing."""
+    from tests.test_web_assistant import FakeActions, ScriptedLLM, tool_call
+    from web.assistant import Assistant
+    actions = FakeActions()
+    llm = ScriptedLLM(tool_call("run_sentinel", mode="security_audit", repo="acme/shop"))
+    await Assistant(llm, actions).reply([], "A security review found an email password written in our code. Please fix it. https://github.com/acme/shop")
+    assert actions.started[0][0] == "diagnose_and_heal" and "email password" in actions.started[0][2]
+    scan = FakeActions()
+    await Assistant(ScriptedLLM(tool_call("run_sentinel", mode="security_audit", repo="acme/shop")), scan).reply(
+        [], "Run a security check on https://github.com/acme/shop")
+    assert scan.started[0][0] == "security_audit"
+
+
 async def test_an_unchanged_answer_is_not_retried_into_a_change(ctx):
     web = store_web()
     web.github.files["requirements.txt"] = "pyyaml==5.3\n"

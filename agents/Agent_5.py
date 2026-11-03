@@ -52,6 +52,16 @@ FIXED, NO_BUG, DEPENDENCIES_ONLY = "fixed", "no_bug", "dependencies_only"
 PATCH_LLM_TIMEOUT = 90.0    # the model rewrites a whole file, which can take far longer than a short answer
 
 
+def _hardening_note(original: str) -> str:
+    done = []
+    if harden_secrets(original) != original:
+        done.append("moves the hardcoded secret out of the code into an environment variable, which must be set wherever "
+                    "the app runs")
+    if fix_unsafe_yaml(original) != original:
+        done.append("loads YAML safely")
+    return ("This fix " + " and ".join(done) + ".") if done else "This fix applies Sentinel's standard security rewrites."
+
+
 class RemediationExecutor:
     def __init__(
         self,
@@ -272,8 +282,13 @@ class RemediationExecutor:
             if st.get("verdict") == DEPENDENCIES_ONLY and st["bumps"]:      # the code stays, only the pins change
                 original, patched = await self._retarget_requirements(st)
             elif st.get("verdict") == NO_BUG or (source == "llm" and patched.strip() == original.strip()):
-                await self._finish_no_bug(ctx, st)
-                return
+                hardened = self._harden(st, original)
+                if hardened.strip() == original.strip():
+                    await self._finish_no_bug(ctx, st)
+                    return
+                # The model only ever sees the file after these rewrites, so it can't tell that they are the fix: a live
+                # report of a hardcoded password got "no change needed" while the password was still in the code.
+                patched, st["explanation"] = hardened, _hardening_note(original)
             reasons = self._local_checks(st, original, patched)
             diff = make_unified_diff(original, patched, st["target_file"])
             st["last_draft"] = {"patched_code": patched, "unified_diff": diff}
